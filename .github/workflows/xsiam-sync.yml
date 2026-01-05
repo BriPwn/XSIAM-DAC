@@ -1,28 +1,63 @@
-name: xsiam-sync
+name: XSIAM Detection Sync
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without pushing changes to XSIAM (validate only)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
-  sync:
+  xsiam-sync:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          pip install requests pyyaml
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Sync detections to XSIAM
+      - name: Show repository tree (debug)
+        run: |
+          echo "Repo root:"
+          ls -la
+          echo ""
+          echo "xsiam/ directory:"
+          find xsiam -type f || true
+
+      - name: Sync detections to Cortex XSIAM
         env:
           XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
           XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
           XSIAM_BASE_URL: ${{ secrets.XSIAM_BASE_URL }}
         run: |
-          python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Running in DRY-RUN mode"
+            python scripts/xsiam_cli.py sync \
+              --repo . \
+              --base-url "$XSIAM_BASE_URL" \
+              --dry-run \
+              --verbose
+          else
+            echo "Running LIVE sync"
+            python scripts/xsiam_cli.py sync \
+              --repo . \
+              --base-url "$XSIAM_BASE_URL" \
+              --verbose
+          fi

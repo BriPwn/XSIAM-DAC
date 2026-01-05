@@ -10,15 +10,14 @@ Environment variables required:
 - XSIAM_API_KEY_ID
 
 Usage:
-  python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL"
+  python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL" --verbose
+  python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL" --dry-run --verbose
 
-Notes (based on your tenant behavior / errors):
-- Correlation create: MUST omit rule_id (rule_id=0 is treated as update and fails)
-- Correlation action: MUST be "ALERTS" if you set severity/alert_* fields
-- lookup_mapping MUST be a list ([])
-- drilldown_query_timeframe enum: "ALERT" or "QUERY"
-- mitre_defs must be an object/map ({}), not a list
-- XQL validator rejects invalid tokens like "notcontains" => must be "not contains(...)"
+What this version adds:
+- Prints how many artifacts were discovered in repo
+- Prints API added/updated/errors summaries
+- Treats "errors" in a 200 response as failure (exit non-zero)
+- Uses safer filter shapes (tries both string and list forms where it matters)
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -39,6 +38,12 @@ import requests
 
 def load_json(p: Path) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def find_json_files(dir_path: Path) -> List[Path]:
+    if not dir_path.exists():
+        return []
+    return sorted([p for p in dir_path.glob("*.json") if p.is_file()])
 
 
 # -----------------------------
@@ -61,50 +66,41 @@ def deep_merge(a: dict, b: dict) -> dict:
 # -----------------------------
 
 def sanitize_xql(xql: str) -> str:
-    """
-    Fix common generator tokens that XQL doesn't accept in your tenant:
-    - notcontains(...) -> not contains(...)
-    - notstartswith(...) -> not startswith(...)
-    - notendswith(...) -> not endswith(...)
-    """
+    """Fix common invalid tokens that show up in generator output."""
     if not xql:
         return xql
-
     xql = re.sub(r"\bnotcontains\s*\(", "not contains(", xql)
     xql = re.sub(r"\bnotstartswith\s*\(", "not startswith(", xql)
     xql = re.sub(r"\bnotendswith\s*\(", "not endswith(", xql)
-
-    # Normalize accidental "notin(" -> "not (field in (...))" cannot be done safely without parsing,
-    # so we do not touch it here.
-
     return xql
 
 
 # -----------------------------
-# Correlation normalization (schema + tenant constraints)
+# Correlation normalization (based on your tenant constraints)
 # -----------------------------
 
 def correlation_required_defaults(name: str) -> dict:
     """
-    Default correlation rule payload that satisfies required fields & your tenant constraints.
-    IMPORTANT: DO NOT set rule_id here. Create must omit rule_id; update includes it.
+    Defaults to satisfy required fields and your tenant constraints seen in errors:
+    - action must be "ALERTS" to allow severity and alert_* fields
+    - lookup_mapping must be a LIST
+    - mitre_defs must be a MAP
+    - drilldown_query_timeframe must be "ALERT" or "QUERY"
+    IMPORTANT: Create must OMIT rule_id; update includes rule_id.
     """
     return {
         "name": name,
         "description": "",
         "xql_query": "",
 
-        # Must be ALERTS to allow severity + alert_* fields
         "action": "ALERTS",
 
-        # Alert fields (valid because action=ALERTS)
         "severity": "SEV_020_LOW",
         "alert_name": name,
         "alert_description": "",
         "alert_category": "OTHER",
         "alert_fields": {},
 
-        # Execution/schedule
         "is_enabled": True,
         "execution_mode": "SCHEDULED",
         "search_window": "30 minutes",
@@ -112,121 +108,97 @@ def correlation_required_defaults(name: str) -> dict:
         "timezone": "UTC",
         "crontab": "*/5 * * * *",
 
-        # Required fields
         "dataset": "alerts",
-        "mapping_strategy": "AUTO",   # enum AUTO/CUSTOM
-        "lookup_mapping": [],        # MUST be list
+        "mapping_strategy": "AUTO",
+        "lookup_mapping": [],
         "suppression_enabled": False,
         "suppression_duration": "0 minutes",
         "suppression_fields": [],
 
-        # UX
         "investigation_query_link": "",
-        "drilldown_query_timeframe": "ALERT",  # enum ALERT/QUERY
+        "drilldown_query_timeframe": "ALERT",
 
-        # MITRE (must be map/object)
         "mitre_defs": {},
 
-        # can be null
         "user_defined_category": None,
         "user_defined_severity": None,
     }
 
 
 def normalize_correlation_payload(rule: dict) -> dict:
-    """
-    Ensure correlation payload matches schema and tenant constraints.
-    """
     name = (rule.get("name") or "unnamed").strip() or "unnamed"
     base = correlation_required_defaults(name)
     merged = deep_merge(base, rule)
 
-    # Never send 'id' from GET responses
+    # never send "id"
     merged.pop("id", None)
 
-    # Core strings
     merged["name"] = name
     merged["description"] = merged.get("description") or ""
     merged["xql_query"] = sanitize_xql(merged.get("xql_query") or "")
 
-    # action must be ALERTS for your tenant when using severity/alert fields
-    if merged.get("action") != "ALERTS":
-        merged["action"] = "ALERTS"
+    # force tenant constraints
+    merged["action"] = "ALERTS"
 
-    # severity enum
-    if merged.get("severity") not in ("SEV_010_INFO", "SEV_020_LOW", "SEV_030_MEDIUM", "SEV_040_HIGH"):
+    sev = merged.get("severity")
+    if sev not in ("SEV_010_INFO", "SEV_020_LOW", "SEV_030_MEDIUM", "SEV_040_HIGH"):
         merged["severity"] = "SEV_020_LOW"
 
-    # alert fields
     merged["alert_name"] = merged.get("alert_name") or name
     merged["alert_description"] = merged.get("alert_description") or merged["description"] or ""
     merged["alert_category"] = merged.get("alert_category") or "OTHER"
+
     if merged.get("alert_fields") is None:
         merged["alert_fields"] = {}
 
-    # schedule
-    merged["execution_mode"] = merged.get("execution_mode") or "SCHEDULED"
-    if merged["execution_mode"] not in ("SCHEDULED", "REAL_TIME"):
-        merged["execution_mode"] = "SCHEDULED"
+    em = merged.get("execution_mode") or "SCHEDULED"
+    merged["execution_mode"] = em if em in ("SCHEDULED", "REAL_TIME") else "SCHEDULED"
 
     merged["search_window"] = merged.get("search_window") or "30 minutes"
     merged["simple_schedule"] = merged.get("simple_schedule") or "5 minutes"
     merged["timezone"] = merged.get("timezone") or "UTC"
     merged["crontab"] = merged.get("crontab") or "*/5 * * * *"
 
-    # required misc
-    merged["dataset"] = merged.get("dataset") or "alerts"
-    merged["mapping_strategy"] = merged.get("mapping_strategy") or "AUTO"
-    if merged["mapping_strategy"] not in ("AUTO", "CUSTOM"):
-        merged["mapping_strategy"] = "AUTO"
+    ms = merged.get("mapping_strategy") or "AUTO"
+    merged["mapping_strategy"] = ms if ms in ("AUTO", "CUSTOM") else "AUTO"
 
-    # lookup_mapping must be LIST
+    # lookup_mapping must be list
     lm = merged.get("lookup_mapping")
-    if lm is None:
-        merged["lookup_mapping"] = []
-    elif isinstance(lm, dict):
-        merged["lookup_mapping"] = []
-    elif not isinstance(lm, list):
-        merged["lookup_mapping"] = []
+    merged["lookup_mapping"] = lm if isinstance(lm, list) else []
 
-    # suppression
+    # mitre_defs must be map
+    md = merged.get("mitre_defs")
+    merged["mitre_defs"] = md if isinstance(md, dict) else {}
+
+    dtf = merged.get("drilldown_query_timeframe")
+    merged["drilldown_query_timeframe"] = dtf if dtf in ("ALERT", "QUERY") else "ALERT"
+
     merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
     merged["suppression_duration"] = merged.get("suppression_duration") or "0 minutes"
     if merged.get("suppression_fields") is None:
         merged["suppression_fields"] = []
 
-    # drilldown enum
-    dtf = merged.get("drilldown_query_timeframe")
-    if dtf not in ("ALERT", "QUERY"):
-        merged["drilldown_query_timeframe"] = "ALERT"
+    merged["is_enabled"] = bool(merged.get("is_enabled", True))
 
-    # MITRE map
-    if merged.get("mitre_defs") is None or isinstance(merged.get("mitre_defs"), list):
-        merged["mitre_defs"] = {}
-
-    # investigation link: safest default is reuse xql_query
     if not merged.get("investigation_query_link"):
         merged["investigation_query_link"] = merged["xql_query"]
 
-    # normalize user_defined_* "" -> None
     if merged.get("user_defined_category") == "":
         merged["user_defined_category"] = None
     if merged.get("user_defined_severity") == "":
         merged["user_defined_severity"] = None
 
-    # booleans
-    merged["is_enabled"] = bool(merged.get("is_enabled", True))
-
     return merged
 
 
 # -----------------------------
-# XSIAM API client
+# XSIAM API client + response handling
 # -----------------------------
 
 class XsiamClient:
-    def __init__(self, base_url: str, api_key: str, api_key_id: str, timeout_s: int = 60):
+    def __init__(self, base_url: str, api_key: str, api_key_id: str, timeout_s: int = 60, verbose: bool = False):
         self.base_url = base_url.rstrip("/")
+        self.verbose = verbose
         self.s = requests.Session()
         self.s.headers.update(
             {
@@ -240,10 +212,246 @@ class XsiamClient:
 
     def post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = self.base_url + path
+        if self.verbose:
+            print(f"\n==> POST {path}")
+            # avoid printing secrets; payload only
+            print(json.dumps(payload, indent=2)[:4000])
+
         r = self.s.post(url, json=payload, timeout=self.timeout_s)
+
+        # Try parse JSON even on non-200 (XSIAM returns structured bodies)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+
         if r.status_code >= 400:
-            try:
-                errj = r.json()
-            except Exception:
-                errj = None
-            raise RuntimeError(f"HTTP {r.status_code} {path}: {r.text}\nParsed JSON: {errj}")
+            raise RuntimeError(f"HTTP {r.status_code} {path}: {r.text}\nParsed JSON: {body}")
+
+        if self.verbose:
+            print(f"<== {path} HTTP {r.status_code}")
+            print(json.dumps(body, indent=2)[:4000])
+
+        return body if isinstance(body, dict) else {}
+
+    # IOCs
+    def ioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
+        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
+        if filters:
+            req["filters"] = filters
+        return self.post("/public_api/v1/indicators/get", {"request_data": req})
+
+    def ioc_insert(self, iocs: List[dict]):
+        return self.post("/public_api/v1/indicators/insert", {"request_data": iocs})
+
+    # BIOCs
+    def bioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
+        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
+        if filters:
+            req["filters"] = filters
+        return self.post("/public_api/v1/bioc/get", {"request_data": req})
+
+    def bioc_insert(self, biocs: List[dict]):
+        return self.post("/public_api/v1/bioc/insert", {"request_data": biocs})
+
+    # Correlations
+    def corr_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
+        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
+        if filters:
+            req["filters"] = filters
+        return self.post("/public_api/v1/correlations/get", {"request_data": req})
+
+    def corr_insert(self, rules: List[dict]):
+        return self.post("/public_api/v1/correlations/insert", {"request_data": rules})
+
+
+def summarize_result(kind: str, res: Dict[str, Any]) -> None:
+    added = res.get("added_objects", [])
+    updated = res.get("updated_objects", [])
+    errors = res.get("errors", [])
+
+    print(f"\n=== {kind} result ===")
+    print(f"Added: {len(added)} | Updated: {len(updated)} | Errors: {len(errors)}")
+
+    if errors:
+        # Print first few errors for readability
+        for e in errors[:10]:
+            print(f"- {e}")
+        # Treat as failure
+        raise RuntimeError(f"{kind} sync returned errors (see above).")
+
+
+# -----------------------------
+# De-dupe helpers
+# -----------------------------
+
+def _try_get_by_name(client: XsiamClient, kind: str, name: str, value_as_list: bool) -> int:
+    """
+    Some tenants expect filter.value as a list; some accept string.
+    We'll try both forms.
+    """
+    value = [name] if value_as_list else name
+    filters = [{"field": "name", "operator": "EQ", "value": value}]
+
+    if kind == "correlation":
+        data = client.corr_get(filters=filters, extended_view=False, search_from=0, search_to=1)
+        objs = data.get("objects") or []
+        return int(objs[0]["id"]) if objs else 0
+
+    if kind == "bioc":
+        data = client.bioc_get(filters=filters, extended_view=False, search_from=0, search_to=1)
+        objs = data.get("objects") or []
+        return int(objs[0]["rule_id"]) if objs else 0
+
+    raise ValueError(kind)
+
+
+def find_existing_id_by_name(client: XsiamClient, kind: str, name: str) -> int:
+    # try string first, then list
+    rid = _try_get_by_name(client, kind, name, value_as_list=False)
+    if rid:
+        return rid
+    return _try_get_by_name(client, kind, name, value_as_list=True)
+
+
+# -----------------------------
+# Command: sync
+# -----------------------------
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    base_url = args.base_url
+    api_key = os.environ["XSIAM_API_KEY"]
+    api_key_id = os.environ["XSIAM_API_KEY_ID"]
+
+    client = XsiamClient(base_url=base_url, api_key=api_key, api_key_id=api_key_id, verbose=args.verbose)
+    repo = Path(args.repo).resolve()
+
+    corr_dir = repo / "xsiam" / "correlation"
+    bioc_dir = repo / "xsiam" / "bioc"
+    ioc_dir = repo / "xsiam" / "ioc"
+
+    corr_files = find_json_files(corr_dir)
+    bioc_files = find_json_files(bioc_dir)
+    ioc_files = find_json_files(ioc_dir)
+
+    print("\n=== Artifact discovery ===")
+    print(f"Correlation JSON: {len(corr_files)} in {corr_dir}")
+    print(f"BIOC JSON:        {len(bioc_files)} in {bioc_dir}")
+    print(f"IOC JSON:         {len(ioc_files)} in {ioc_dir}")
+
+    if args.verbose:
+        if corr_files:
+            print("Correlation files:", [p.name for p in corr_files])
+        if bioc_files:
+            print("BIOC files:", [p.name for p in bioc_files])
+        if ioc_files:
+            print("IOC files:", [p.name for p in ioc_files])
+
+    if not (corr_files or bioc_files or ioc_files):
+        raise RuntimeError("No artifacts found to sync. Check repo folder paths and committed JSON files.")
+
+    corr_objs = [load_json(p) for p in corr_files]
+    bioc_objs = [load_json(p) for p in bioc_files]
+    ioc_objs = [load_json(p) for p in ioc_files]
+
+    # ---- Correlations ----
+    if corr_objs:
+        upserts: List[dict] = []
+        for obj in corr_objs:
+            name = obj.get("name")
+            if not name:
+                raise ValueError("Correlation JSON missing required 'name' field")
+
+            existing_id = find_existing_id_by_name(client, "correlation", name)
+            o = normalize_correlation_payload(dict(obj))
+
+            # Your tenant: create must omit rule_id; update includes it
+            if existing_id:
+                o["rule_id"] = existing_id
+            else:
+                o.pop("rule_id", None)
+
+            upserts.append(o)
+
+        if args.dry_run:
+            print("\n[DRY RUN] Would sync correlations:", len(upserts))
+        else:
+            res = client.corr_insert(upserts)
+            summarize_result("Correlation rules", res)
+
+    # ---- BIOCs ----
+    if bioc_objs:
+        upserts = []
+        for obj in bioc_objs:
+            name = obj.get("name")
+            if not name:
+                raise ValueError("BIOC JSON missing required 'name' field")
+
+            existing_id = find_existing_id_by_name(client, "bioc", name)
+            o = dict(obj)
+
+            # Many tenants accept rule_id=0 for create, but if yours doesn't, omit on create like correlations
+            if existing_id:
+                o["rule_id"] = existing_id
+            else:
+                # safest: omit on create (avoids "update 0" pattern)
+                o.pop("rule_id", None)
+
+            upserts.append(o)
+
+        if args.dry_run:
+            print("\n[DRY RUN] Would sync BIOCs:", len(upserts))
+        else:
+            res = client.bioc_insert(upserts)
+            summarize_result("BIOCs", res)
+
+    # ---- IOCs ----
+    if ioc_objs:
+        upserts = []
+        for ioc in ioc_objs:
+            indicator = ioc.get("indicator")
+            ioc_type = ioc.get("type")
+            if not indicator or not ioc_type:
+                raise ValueError("IOC JSON must include 'indicator' and 'type'")
+
+            filters = [
+                {"field": "indicator", "operator": "EQ", "value": [indicator]},
+                {"field": "type", "operator": "EQ", "value": [ioc_type]},
+            ]
+            data = client.ioc_get(filters=filters, extended_view=False, search_from=0, search_to=1)
+            objs = data.get("objects") or []
+            existing_rule_id = int(objs[0]["rule_id"]) if objs else 0
+
+            o = dict(ioc)
+            if existing_rule_id:
+                o["rule_id"] = existing_rule_id
+            else:
+                # safest create: omit rule_id
+                o.pop("rule_id", None)
+
+            upserts.append(o)
+
+        if args.dry_run:
+            print("\n[DRY RUN] Would sync IOCs:", len(upserts))
+        else:
+            res = client.ioc_insert(upserts)
+            summarize_result("IOCs", res)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("sync", help="Sync JSON artifacts in repo into XSIAM")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--base-url", required=True, help="Your XSIAM tenant base URL, e.g. https://api-<tenant>")
+    s.add_argument("--dry-run", action="store_true", help="Do not call XSIAM APIs; just print what would happen")
+    s.add_argument("--verbose", action="store_true", help="Print request/response payloads (truncated)")
+    s.set_defaults(func=cmd_sync)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
