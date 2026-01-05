@@ -33,7 +33,7 @@ def load_json(p: Path) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Dict merge + normalization helpers
+# Dict merge helpers
 # -----------------------------
 
 def deep_merge(a: dict, b: dict) -> dict:
@@ -47,106 +47,142 @@ def deep_merge(a: dict, b: dict) -> dict:
     return out
 
 
+# -----------------------------
+# Correlation normalization (schema-complete + correct types)
+# -----------------------------
+#
+# XSIAM correlations/insert has strict schema requirements. In particular:
+# - drilldown_query_timeframe is enum: "QUERY" or "ALERT"
+# - mapping_strategy is enum: "AUTO" or "CUSTOM"
+# - mitre_defs is an OBJECT (map), not a list
+# - user_defined_* can be null
+# See official API reference. :contentReference[oaicite:4]{index=4}
+
 def correlation_required_defaults(name: str) -> dict:
     """
-    /public_api/v1/correlations/insert requires a large set of fields (even if unused).
-    Provide conservative defaults that satisfy the schema.
-
-    IMPORTANT:
-    Some tenants do NOT allow rule_id=0 for create. We will omit rule_id for create later.
+    Default correlation rule payload that satisfies required fields & types.
     """
+    # NOTE: docs show rule_id in body parameters and client snippets use rule_id=0 on insert. :contentReference[oaicite:5]{index=5}
     return {
-        # Identity / core (rule_id handled later)
+        "rule_id": 0,  # create semantics typically use 0; we also implement a fallback retry
         "name": name,
-        "description": "",
         "severity": "SEV_020_LOW",
+        "xql_query": "",
         "is_enabled": True,
+        "description": "",
 
-        # Execution/schedule
-        "execution_mode": "SCHEDULED",
+        "alert_name": name,
+        "alert_category": "OTHER",       # enum; see docs for allowed values :contentReference[oaicite:6]{index=6}
+        "alert_description": "",
+        "alert_fields": {},
+
+        "execution_mode": "SCHEDULED",   # enum: SCHEDULED / REAL_TIME :contentReference[oaicite:7]{index=7}
         "search_window": "30 minutes",
         "simple_schedule": "5 minutes",
-        "crontab": "",  # required by API; keep empty when using simple_schedule
         "timezone": "UTC",
-
-        # Data/query
-        "dataset": "alerts",  # required by API (set to your dataset if you prefer)
-        "xql_query": "",
-
-        # Alert metadata (required)
-        "alert_name": name,
-        "alert_description": "",
-        "alert_category": "OTHER",
-        "alert_domain": "OTHER",  # may be validated by tenant
-        "alert_type": "OTHER",    # may be validated by tenant
-        "user_defined_category": "",
-        "user_defined_severity": "",
-
-        # Mapping/actions (required)
-        "mapping_strategy": "AUTO",
-        "lookup_mapping": {},
-        "alert_fields": {},
-        "action": {},
-
-        # UX fields (required)
-        "investigation_query_link": "",
-        "drilldown_query_timeframe": "30 minutes",
-
-        # MITRE (required)
-        "mitre_defs": [],
-
-        # Suppression (required)
+        "crontab": "*/5 * * * *",        # required string; safe default
         "suppression_enabled": False,
-        "suppression_fields": [],
         "suppression_duration": "0 minutes",
+        "suppression_fields": [],
+
+        "dataset": "alerts",
+        "user_defined_severity": None,   # null is acceptable per example :contentReference[oaicite:8]{index=8}
+        "user_defined_category": None,   # null is acceptable per example :contentReference[oaicite:9]{index=9}
+
+        "mitre_defs": {},                # must be object/map :contentReference[oaicite:10]{index=10}
+        "investigation_query_link": "",  # should be valid XQL or empty; we set to xql_query if missing
+        "drilldown_query_timeframe": "ALERT",  # enum: QUERY / ALERT :contentReference[oaicite:11]{index=11}
+        "mapping_strategy": "AUTO",      # enum: AUTO / CUSTOM :contentReference[oaicite:12]{index=12}
+
+        # These are in the earlier “required fields” error list you saw.
+        # Some tenants accept them absent; yours required them then.
+        "lookup_mapping": {},            # keep as object
+        "action": {},                    # keep as object
     }
 
 
 def normalize_correlation_payload(rule: dict) -> dict:
     """
-    Ensures correlation payload is schema-complete for /correlations/insert.
+    Ensure payload is schema-correct:
+    - required keys exist
+    - types match expected schema
+    - enums are valid defaults
     """
     name = (rule.get("name") or "unnamed").strip() or "unnamed"
     base = correlation_required_defaults(name)
     merged = deep_merge(base, rule)
 
-    # Ensure required string fields exist
-    merged["crontab"] = merged.get("crontab") or ""
-    merged["simple_schedule"] = merged.get("simple_schedule") or "5 minutes"
-    merged["search_window"] = merged.get("search_window") or "30 minutes"
-    merged["timezone"] = merged.get("timezone") or "UTC"
-    merged["dataset"] = merged.get("dataset") or "alerts"
+    # Drop accidental 'id' field if present (get endpoint returns id; insert uses rule_id). :contentReference[oaicite:13]{index=13}
+    merged.pop("id", None)
+
+    # Strings
+    merged["name"] = name
+    merged["description"] = merged.get("description") or ""
     merged["xql_query"] = merged.get("xql_query") or ""
 
     merged["alert_name"] = merged.get("alert_name") or name
-    merged["alert_description"] = merged.get("alert_description") or merged.get("description") or ""
-    merged["alert_category"] = merged.get("alert_category") or "OTHER"
-    merged["alert_domain"] = merged.get("alert_domain") or "OTHER"
-    merged["alert_type"] = merged.get("alert_type") or "OTHER"
-    merged["user_defined_category"] = merged.get("user_defined_category") or ""
-    merged["user_defined_severity"] = merged.get("user_defined_severity") or ""
+    merged["alert_description"] = merged.get("alert_description") or merged["description"] or ""
 
-    merged["investigation_query_link"] = merged.get("investigation_query_link") or ""
-    merged["drilldown_query_timeframe"] = merged.get("drilldown_query_timeframe") or merged["search_window"]
+    merged["search_window"] = merged.get("search_window") or "30 minutes"
+    merged["simple_schedule"] = merged.get("simple_schedule") or "5 minutes"
+    merged["timezone"] = merged.get("timezone") or "UTC"
+    merged["crontab"] = merged.get("crontab") or "*/5 * * * *"
+    merged["dataset"] = merged.get("dataset") or "alerts"
+    merged["suppression_duration"] = merged.get("suppression_duration") or "0 minutes"
 
-    # Ensure required containers exist
+    # Required objects
     if merged.get("alert_fields") is None:
         merged["alert_fields"] = {}
     if merged.get("lookup_mapping") is None:
         merged["lookup_mapping"] = {}
     if merged.get("action") is None:
         merged["action"] = {}
-    if merged.get("mitre_defs") is None:
-        merged["mitre_defs"] = []
+
+    # Required arrays
     if merged.get("suppression_fields") is None:
         merged["suppression_fields"] = []
 
-    # Coerce booleans
-    merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
-    merged["is_enabled"] = bool(merged.get("is_enabled", True))
+    # mitre_defs MUST be an object/map, not a list
+    if merged.get("mitre_defs") is None or isinstance(merged.get("mitre_defs"), list):
+        merged["mitre_defs"] = {}
 
-    # IMPORTANT: avoid passing an "id" field accidentally
-    merged.pop("id", None)
+    # drilldown_query_timeframe MUST be enum QUERY/ALERT
+    dtf = merged.get("drilldown_query_timeframe")
+    if dtf not in ("QUERY", "ALERT"):
+        merged["drilldown_query_timeframe"] = "ALERT"
+
+    # mapping_strategy MUST be enum AUTO/CUSTOM
+    ms = merged.get("mapping_strategy")
+    if ms not in ("AUTO", "CUSTOM"):
+        merged["mapping_strategy"] = "AUTO"
+
+    # execution_mode MUST be enum SCHEDULED/REAL_TIME
+    em = merged.get("execution_mode")
+    if em not in ("SCHEDULED", "REAL_TIME"):
+        merged["execution_mode"] = "SCHEDULED"
+
+    # severity MUST be enum
+    sev = merged.get("severity")
+    if sev not in ("SEV_010_INFO", "SEV_020_LOW", "SEV_030_MEDIUM", "SEV_040_HIGH"):
+        merged["severity"] = "SEV_020_LOW"
+
+    # alert_category MUST be one of allowed enums; keep OTHER as safe default.
+    if not merged.get("alert_category"):
+        merged["alert_category"] = "OTHER"
+
+    # booleans
+    merged["is_enabled"] = bool(merged.get("is_enabled", True))
+    merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
+
+    # investigation_query_link: best default is same as xql_query
+    if not merged.get("investigation_query_link"):
+        merged["investigation_query_link"] = merged["xql_query"]
+
+    # user_defined_* should be null (None) or valid string; normalize "" -> None
+    if merged.get("user_defined_category") == "":
+        merged["user_defined_category"] = None
+    if merged.get("user_defined_severity") == "":
+        merged["user_defined_severity"] = None
 
     return merged
 
@@ -179,8 +215,15 @@ class XsiamClient:
     def post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = self.base_url + path
         r = self.s.post(url, json=payload, timeout=self.timeout_s)
+
         if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code} {path}: {r.text}")
+            # Try to include JSON body (sometimes contains more detail than text)
+            try:
+                errj = r.json()
+            except Exception:
+                errj = None
+            raise RuntimeError(f"HTTP {r.status_code} {path}: {r.text}\nParsed JSON: {errj}")
+
         return r.json()
 
     # IOCs
@@ -245,8 +288,34 @@ def find_existing_id_by_name(client: XsiamClient, kind: str, name: str) -> int:
     if kind == "correlation":
         data = client.corr_get(filters=filters, extended_view=False, search_from=0, search_to=1)
         objs = data.get("objects") or []
-        return int(objs[0]["id"]) if objs else 0  # correlations/get returns "id"
+        return int(objs[0]["id"]) if objs else 0  # correlations/get returns "id" :contentReference[oaicite:14]{index=14}
     raise ValueError(kind)
+
+
+def corr_insert_with_create_fallback(client: XsiamClient, payloads: List[dict]) -> Dict[str, Any]:
+    """
+    Some tenants behave oddly regarding create semantics:
+    - docs show rule_id=0 is used in client snippets :contentReference[oaicite:15]{index=15}
+    - but some environments return "cannot update rule 0"
+    So we try:
+      1) send as-is
+      2) if error contains "does not exist and therefore cannot be updated", retry by omitting rule_id for those creates
+    """
+    try:
+        return client.corr_insert(payloads)
+    except RuntimeError as e:
+        msg = str(e)
+        if "does not exist and therefore cannot be updated" not in msg:
+            raise
+
+        # Retry: remove rule_id for rules that have rule_id==0 (creates)
+        retry_payloads = []
+        for p in payloads:
+            pp = dict(p)
+            if pp.get("rule_id", 0) == 0:
+                pp.pop("rule_id", None)
+            retry_payloads.append(pp)
+        return client.corr_insert(retry_payloads)
 
 
 # -----------------------------
@@ -275,8 +344,6 @@ def cmd_sync(args: argparse.Namespace) -> None:
     ioc_objs = [load_json(p) for p in ioc_files]
 
     # ---- Correlations ----
-    # Tenants vary: many do NOT accept rule_id=0 for create.
-    # We only include rule_id when updating an existing correlation.
     if corr_objs:
         upserts = []
         for obj in corr_objs:
@@ -286,23 +353,18 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
             existing_id = find_existing_id_by_name(client, "correlation", name)
 
-            o = dict(obj)
-            o = normalize_correlation_payload(o)
+            o = normalize_correlation_payload(dict(obj))
 
-            if existing_id:
-                o["rule_id"] = existing_id  # update existing
-            else:
-                # create new: omit rule_id entirely
-                o.pop("rule_id", None)
+            # Update existing rules by rule_id; create uses rule_id=0 (per docs snippets) :contentReference[oaicite:16]{index=16}
+            o["rule_id"] = existing_id if existing_id else 0
 
             upserts.append(o)
 
-        client.corr_insert(upserts)
+        corr_insert_with_create_fallback(client, upserts)
         print(f"Synced correlations: {len(upserts)}")
 
     # ---- BIOCs ----
-    # For BIOCs, rule_id=0 is commonly used for create, but some tenants may also accept omit.
-    # We'll follow your prior behavior; if you hit a similar error, we can apply same omit-on-create logic.
+    # If BIOCs later throw "cannot update 0" we can apply same omit/retry logic.
     if bioc_objs:
         upserts = []
         for obj in bioc_objs:
@@ -311,21 +373,14 @@ def cmd_sync(args: argparse.Namespace) -> None:
                 raise ValueError("BIOC JSON missing required 'name' field")
 
             existing_id = find_existing_id_by_name(client, "bioc", name)
-
             o = dict(obj)
-            if existing_id:
-                o["rule_id"] = existing_id
-            else:
-                # keep 0 for create (or omit if you prefer)
-                o["rule_id"] = 0
-
+            o["rule_id"] = existing_id if existing_id else 0
             upserts.append(o)
 
         client.bioc_insert(upserts)
         print(f"Synced BIOCs: {len(upserts)}")
 
     # ---- IOCs (optional) ----
-    # De-dupe by (indicator,type): query to find existing rule_id, then upsert with that rule_id.
     if ioc_objs:
         upserts = []
         for ioc in ioc_objs:
@@ -343,7 +398,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             existing_rule_id = int(objs[0]["rule_id"]) if objs else 0
 
             o = dict(ioc)
-            o["rule_id"] = existing_rule_id  # 0 means create for most tenants
+            o["rule_id"] = existing_rule_id
             upserts.append(o)
 
         client.ioc_insert(upserts)
