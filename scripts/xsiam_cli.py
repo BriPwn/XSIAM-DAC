@@ -2,15 +2,10 @@
 """
 XSIAM Detection-as-Code CLI (GitHub-friendly)
 
-Current commands:
+Commands:
 - sync: Upsert Correlation Rules, BIOCs, and (optionally) IOCs from repo JSON into Cortex XSIAM.
 
-Key behaviors:
-- De-duplication by deterministic object "name" (your SIGMA:... prefix approach).
-- For correlation rules, the /correlations/insert endpoint is strict and requires many fields.
-  This script normalizes correlation payloads to be schema-complete before insert.
-
-Environment variables required for sync:
+Environment variables required:
 - XSIAM_API_KEY
 - XSIAM_API_KEY_ID
 
@@ -37,10 +32,6 @@ def load_json(p: Path) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def slugify(s: str) -> str:
-    return "".join(c.lower() if c.isalnum() else "-" for c in s).strip("-")
-
-
 # -----------------------------
 # Dict merge + normalization helpers
 # -----------------------------
@@ -60,10 +51,12 @@ def correlation_required_defaults(name: str) -> dict:
     """
     /public_api/v1/correlations/insert requires a large set of fields (even if unused).
     Provide conservative defaults that satisfy the schema.
+
+    IMPORTANT:
+    Some tenants do NOT allow rule_id=0 for create. We will omit rule_id for create later.
     """
     return {
-        # Identity / core
-        "rule_id": 0,
+        # Identity / core (rule_id handled later)
         "name": name,
         "description": "",
         "severity": "SEV_020_LOW",
@@ -84,16 +77,16 @@ def correlation_required_defaults(name: str) -> dict:
         "alert_name": name,
         "alert_description": "",
         "alert_category": "OTHER",
-        "alert_domain": "OTHER",  # required (may be validated by tenant)
-        "alert_type": "OTHER",    # required (may be validated by tenant)
-        "user_defined_category": "",  # required
-        "user_defined_severity": "",  # required
+        "alert_domain": "OTHER",  # may be validated by tenant
+        "alert_type": "OTHER",    # may be validated by tenant
+        "user_defined_category": "",
+        "user_defined_severity": "",
 
         # Mapping/actions (required)
         "mapping_strategy": "AUTO",
-        "lookup_mapping": {},  # required
-        "alert_fields": {},    # required
-        "action": {},          # required (empty is OK)
+        "lookup_mapping": {},
+        "alert_fields": {},
+        "action": {},
 
         # UX fields (required)
         "investigation_query_link": "",
@@ -112,8 +105,6 @@ def correlation_required_defaults(name: str) -> dict:
 def normalize_correlation_payload(rule: dict) -> dict:
     """
     Ensures correlation payload is schema-complete for /correlations/insert.
-    If your tenant enforces strict enums for alert_domain/alert_type/mapping_strategy/etc.,
-    you may need to adjust defaults above.
     """
     name = (rule.get("name") or "unnamed").strip() or "unnamed"
     base = correlation_required_defaults(name)
@@ -150,12 +141,12 @@ def normalize_correlation_payload(rule: dict) -> dict:
     if merged.get("suppression_fields") is None:
         merged["suppression_fields"] = []
 
-    # Ensure suppression fields are coherent
-    merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
-    merged["suppression_duration"] = merged.get("suppression_duration") or "0 minutes"
-
     # Coerce booleans
+    merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
     merged["is_enabled"] = bool(merged.get("is_enabled", True))
+
+    # IMPORTANT: avoid passing an "id" field accidentally
+    merged.pop("id", None)
 
     return merged
 
@@ -254,8 +245,7 @@ def find_existing_id_by_name(client: XsiamClient, kind: str, name: str) -> int:
     if kind == "correlation":
         data = client.corr_get(filters=filters, extended_view=False, search_from=0, search_to=1)
         objs = data.get("objects") or []
-        # correlations/get returns "id"
-        return int(objs[0]["id"]) if objs else 0
+        return int(objs[0]["id"]) if objs else 0  # correlations/get returns "id"
     raise ValueError(kind)
 
 
@@ -284,42 +274,58 @@ def cmd_sync(args: argparse.Namespace) -> None:
     bioc_objs = [load_json(p) for p in bioc_files]
     ioc_objs = [load_json(p) for p in ioc_files]
 
-    # Upsert Correlations (de-dupe by name, normalize required fields)
+    # ---- Correlations ----
+    # Tenants vary: many do NOT accept rule_id=0 for create.
+    # We only include rule_id when updating an existing correlation.
     if corr_objs:
         upserts = []
         for obj in corr_objs:
             name = obj.get("name")
             if not name:
                 raise ValueError("Correlation JSON missing required 'name' field")
+
             existing_id = find_existing_id_by_name(client, "correlation", name)
 
             o = dict(obj)
-            o["rule_id"] = existing_id or 0  # set 0 for create, existing id for update
             o = normalize_correlation_payload(o)
+
+            if existing_id:
+                o["rule_id"] = existing_id  # update existing
+            else:
+                # create new: omit rule_id entirely
+                o.pop("rule_id", None)
 
             upserts.append(o)
 
         client.corr_insert(upserts)
         print(f"Synced correlations: {len(upserts)}")
 
-    # Upsert BIOCs (de-dupe by name)
+    # ---- BIOCs ----
+    # For BIOCs, rule_id=0 is commonly used for create, but some tenants may also accept omit.
+    # We'll follow your prior behavior; if you hit a similar error, we can apply same omit-on-create logic.
     if bioc_objs:
         upserts = []
         for obj in bioc_objs:
             name = obj.get("name")
             if not name:
                 raise ValueError("BIOC JSON missing required 'name' field")
+
             existing_id = find_existing_id_by_name(client, "bioc", name)
 
             o = dict(obj)
-            o["rule_id"] = existing_id or 0
+            if existing_id:
+                o["rule_id"] = existing_id
+            else:
+                # keep 0 for create (or omit if you prefer)
+                o["rule_id"] = 0
 
             upserts.append(o)
 
         client.bioc_insert(upserts)
         print(f"Synced BIOCs: {len(upserts)}")
 
-    # Upsert IOCs (optional folder) — de-dupe by (indicator, type)
+    # ---- IOCs (optional) ----
+    # De-dupe by (indicator,type): query to find existing rule_id, then upsert with that rule_id.
     if ioc_objs:
         upserts = []
         for ioc in ioc_objs:
@@ -337,7 +343,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             existing_rule_id = int(objs[0]["rule_id"]) if objs else 0
 
             o = dict(ioc)
-            o["rule_id"] = existing_rule_id
+            o["rule_id"] = existing_rule_id  # 0 means create for most tenants
             upserts.append(o)
 
         client.ioc_insert(upserts)
