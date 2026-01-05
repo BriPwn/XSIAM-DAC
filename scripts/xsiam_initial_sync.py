@@ -13,6 +13,11 @@ Env vars required:
 
 Usage:
   python scripts/xsiam_initial_sync.py export --repo . --base-url "$XSIAM_BASE_URL"
+  python scripts/xsiam_initial_sync.py export --repo . --base-url "$XSIAM_BASE_URL" --verbose
+
+Tenant constraint learned from your error:
+- correlations/get requires 0 < search_size <= 100
+So we page at 100.
 """
 
 from __future__ import annotations
@@ -24,9 +29,11 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import requests
+
+PAGE_SIZE_MAX = 100  # Tenant hard limit from error
 
 
 # -----------------------------
@@ -79,21 +86,30 @@ class XsiamClient:
 
     def post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = self.base_url + path
+
+        if self.verbose:
+            print(f"\n==> POST {path}")
+            print(json.dumps(payload, indent=2)[:4000])
+
         r = self.s.post(url, json=payload, timeout=self.timeout_s)
+
         try:
             body = r.json()
         except Exception:
             body = None
 
+        # XSIAM sometimes returns 599 for "application-level" errors
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code} {path}: {r.text}\nParsed JSON: {body}")
 
-        if not isinstance(body, dict):
-            return {}
-        return body
+        if self.verbose:
+            print(f"<== {path} HTTP {r.status_code}")
+            print(json.dumps(body, indent=2)[:4000])
+
+        return body if isinstance(body, dict) else {}
 
     # Correlations
-    def corr_get(self, filters: Optional[List[dict]] = None, extended_view: bool = True, search_from: int = 0, search_to: int = 200):
+    def corr_get(self, filters: Optional[List[dict]] = None, extended_view: bool = True, search_from: int = 0, search_to: int = 100):
         req: Dict[str, Any] = {
             "extended_view": extended_view,
             "search_from": search_from,
@@ -104,7 +120,7 @@ class XsiamClient:
         return self.post("/public_api/v1/correlations/get", {"request_data": req})
 
     # BIOCs
-    def bioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = True, search_from: int = 0, search_to: int = 200):
+    def bioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = True, search_from: int = 0, search_to: int = 100):
         req: Dict[str, Any] = {
             "extended_view": extended_view,
             "search_from": search_from,
@@ -115,7 +131,7 @@ class XsiamClient:
         return self.post("/public_api/v1/bioc/get", {"request_data": req})
 
     # IOCs
-    def ioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = True, search_from: int = 0, search_to: int = 200):
+    def ioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = True, search_from: int = 0, search_to: int = 100):
         req: Dict[str, Any] = {
             "extended_view": extended_view,
             "search_from": search_from,
@@ -131,25 +147,40 @@ class XsiamClient:
 # -----------------------------
 
 def fetch_all(
-    fetch_page_fn,
-    page_size: int = 200,
+    fetch_page_fn: Callable[..., Dict[str, Any]],
+    page_size: int = PAGE_SIZE_MAX,
     hard_limit: int = 100000,
+    verbose: bool = False,
 ) -> List[dict]:
+    """
+    Pages using search_from/search_to.
+    Tenant requires 0 < (search_to - search_from) <= 100.
+    """
     all_objs: List[dict] = []
     search_from = 0
+    page_size = min(max(1, page_size), PAGE_SIZE_MAX)
+
     while True:
         search_to = search_from + page_size
+        # Clamp to max size (defensive)
+        if (search_to - search_from) > PAGE_SIZE_MAX:
+            search_to = search_from + PAGE_SIZE_MAX
+
         data = fetch_page_fn(search_from=search_from, search_to=search_to)
         objs = data.get("objects") or []
         all_objs.extend(objs)
 
-        # objects_count is sometimes total; sometimes count of returned. We'll stop when returned < page_size.
+        if verbose:
+            print(f"Fetched {len(objs)} objects (range {search_from}-{search_to}), total so far {len(all_objs)}")
+
+        # Stop when last page is short
         if len(objs) < page_size:
             break
 
         search_from += page_size
         if search_from >= hard_limit:
             break
+
     return all_objs
 
 
@@ -157,11 +188,14 @@ def fetch_all(
 # Exporters
 # -----------------------------
 
-def export_correlations(client: XsiamClient, out_dir: Path) -> List[Path]:
-    objs = fetch_all(lambda search_from, search_to: client.corr_get(search_from=search_from, search_to=search_to, extended_view=True))
+def export_correlations(client: XsiamClient, out_dir: Path, verbose: bool) -> List[Path]:
+    objs = fetch_all(
+        lambda search_from, search_to: client.corr_get(search_from=search_from, search_to=search_to, extended_view=True),
+        page_size=PAGE_SIZE_MAX,
+        verbose=verbose,
+    )
     written: List[Path] = []
     for o in objs:
-        # correlations/get returns id
         rid = o.get("id")
         name = o.get("name") or "unnamed"
         fname = f"{safe_filename(name)}__{rid}.json"
@@ -171,8 +205,12 @@ def export_correlations(client: XsiamClient, out_dir: Path) -> List[Path]:
     return written
 
 
-def export_biocs(client: XsiamClient, out_dir: Path) -> List[Path]:
-    objs = fetch_all(lambda search_from, search_to: client.bioc_get(search_from=search_from, search_to=search_to, extended_view=True))
+def export_biocs(client: XsiamClient, out_dir: Path, verbose: bool) -> List[Path]:
+    objs = fetch_all(
+        lambda search_from, search_to: client.bioc_get(search_from=search_from, search_to=search_to, extended_view=True),
+        page_size=PAGE_SIZE_MAX,
+        verbose=verbose,
+    )
     written: List[Path] = []
     for o in objs:
         rid = o.get("rule_id")
@@ -184,8 +222,12 @@ def export_biocs(client: XsiamClient, out_dir: Path) -> List[Path]:
     return written
 
 
-def export_iocs(client: XsiamClient, out_dir: Path) -> List[Path]:
-    objs = fetch_all(lambda search_from, search_to: client.ioc_get(search_from=search_from, search_to=search_to, extended_view=True))
+def export_iocs(client: XsiamClient, out_dir: Path, verbose: bool) -> List[Path]:
+    objs = fetch_all(
+        lambda search_from, search_to: client.ioc_get(search_from=search_from, search_to=search_to, extended_view=True),
+        page_size=PAGE_SIZE_MAX,
+        verbose=verbose,
+    )
     written: List[Path] = []
     for o in objs:
         rid = o.get("rule_id")
@@ -220,20 +262,21 @@ def cmd_export(args: argparse.Namespace) -> None:
         "base_url": base_url,
         "counts": {},
         "paths": {},
+        "page_size": PAGE_SIZE_MAX,
     }
 
     print("Exporting Correlation rules...")
-    corr_written = export_correlations(client, corr_dir)
+    corr_written = export_correlations(client, corr_dir, verbose=args.verbose)
     manifest["counts"]["correlation"] = len(corr_written)
     manifest["paths"]["correlation"] = str(corr_dir)
 
     print("Exporting BIOCs...")
-    bioc_written = export_biocs(client, bioc_dir)
+    bioc_written = export_biocs(client, bioc_dir, verbose=args.verbose)
     manifest["counts"]["bioc"] = len(bioc_written)
     manifest["paths"]["bioc"] = str(bioc_dir)
 
     print("Exporting IOCs...")
-    ioc_written = export_iocs(client, ioc_dir)
+    ioc_written = export_iocs(client, ioc_dir, verbose=args.verbose)
     manifest["counts"]["ioc"] = len(ioc_written)
     manifest["paths"]["ioc"] = str(ioc_dir)
 
