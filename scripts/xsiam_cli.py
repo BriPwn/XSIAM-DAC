@@ -2,8 +2,10 @@
 """
 XSIAM Detection-as-Code CLI (GitHub-friendly)
 
-Commands:
-- sync: Upsert Correlation Rules, BIOCs, and (optionally) IOCs from repo JSON into Cortex XSIAM.
+Syncs repo JSON artifacts into Cortex XSIAM:
+- Correlation rules:  xsiam/correlation/*.json
+- BIOCs:              xsiam/bioc/*.json
+- IOCs:               xsiam/ioc/*.json
 
 Environment variables required:
 - XSIAM_API_KEY
@@ -13,13 +15,15 @@ Usage:
   python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL" --verbose
   python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL" --dry-run --verbose
 
-Tenant behavior learned from your errors:
-- correlations/get filter for name: value MUST be a string (NOT a list)
-- correlation create: omit rule_id
-- correlation action must be "ALERTS" to allow severity/alert_* fields
+Tenant behaviors incorporated (from your errors/logs):
+- correlations/get filter name value MUST be a string (NOT list)
+- correlation create: omit rule_id (rule_id=0 treated as update)
+- correlation action must be "ALERTS" if alert_* / severity are set
 - lookup_mapping must be a list
-- mitre_defs must be an object/map
+- mitre_defs must be a map/object
 - drilldown_query_timeframe: "ALERT" or "QUERY"
+- XQL generator tokens like notcontains(...) must be rewritten to "not contains(...)"
+- Bad escape patterns like "$\\" should be corrected to "$"
 """
 
 from __future__ import annotations
@@ -68,12 +72,24 @@ def deep_merge(a: dict, b: dict) -> dict:
 # -----------------------------
 
 def sanitize_xql(xql: str) -> str:
-    """Fix common invalid tokens that show up in generator output."""
+    """
+    Make XQL safe for correlation rule validation by fixing common invalid tokens and escapes.
+    - notcontains( -> not contains(
+    - notstartswith( -> not startswith(
+    - notendswith( -> not endswith(
+    - fix accidental "$\\" sequence to "$" (common JSON escaping mistake)
+    """
     if not xql:
         return xql
-    xql = re.sub(r"\bnotcontains\s*\(", "not contains(", xql)
-    xql = re.sub(r"\bnotstartswith\s*\(", "not startswith(", xql)
-    xql = re.sub(r"\bnotendswith\s*\(", "not endswith(", xql)
+
+    # normalize common bad composite tokens (case-insensitive)
+    xql = re.sub(r"\bnotcontains\s*\(", "not contains(", xql, flags=re.IGNORECASE)
+    xql = re.sub(r"\bnotstartswith\s*\(", "not startswith(", xql, flags=re.IGNORECASE)
+    xql = re.sub(r"\bnotendswith\s*\(", "not endswith(", xql, flags=re.IGNORECASE)
+
+    # fix a very common escaping bug: "$\\" becomes "$\" in XQL -> should be "$"
+    xql = xql.replace("$\\", "$")
+
     return xql
 
 
@@ -82,11 +98,16 @@ def sanitize_xql(xql: str) -> str:
 # -----------------------------
 
 def correlation_required_defaults(name: str) -> dict:
+    """
+    Default correlation rule payload satisfying required fields + tenant constraints.
+    IMPORTANT: Create must omit rule_id; update includes rule_id.
+    """
     return {
         "name": name,
         "description": "",
         "xql_query": "",
 
+        # Tenant constraint: if alert/severity fields exist, action must be ALERTS
         "action": "ALERTS",
 
         "severity": "SEV_020_LOW",
@@ -104,15 +125,16 @@ def correlation_required_defaults(name: str) -> dict:
 
         "dataset": "alerts",
         "mapping_strategy": "AUTO",
-        "lookup_mapping": [],
+        "lookup_mapping": [],  # MUST be list
         "suppression_enabled": False,
         "suppression_duration": "0 minutes",
         "suppression_fields": [],
 
         "investigation_query_link": "",
-        "drilldown_query_timeframe": "ALERT",
+        "drilldown_query_timeframe": "ALERT",  # enum ALERT/QUERY
 
         "mitre_defs": {},
+
         "user_defined_category": None,
         "user_defined_severity": None,
     }
@@ -123,48 +145,63 @@ def normalize_correlation_payload(rule: dict) -> dict:
     base = correlation_required_defaults(name)
     merged = deep_merge(base, rule)
 
-    merged.pop("id", None)  # don't send
+    # never send "id" from GET responses
+    merged.pop("id", None)
+
     merged["name"] = name
     merged["description"] = merged.get("description") or ""
     merged["xql_query"] = sanitize_xql(merged.get("xql_query") or "")
 
+    # enforce action=ALERTS for your tenant
     merged["action"] = "ALERTS"
 
+    # severity enum enforcement
     if merged.get("severity") not in ("SEV_010_INFO", "SEV_020_LOW", "SEV_030_MEDIUM", "SEV_040_HIGH"):
         merged["severity"] = "SEV_020_LOW"
 
+    # alert fields
     merged["alert_name"] = merged.get("alert_name") or name
     merged["alert_description"] = merged.get("alert_description") or merged["description"] or ""
     merged["alert_category"] = merged.get("alert_category") or "OTHER"
     if merged.get("alert_fields") is None:
         merged["alert_fields"] = {}
 
+    # schedule
     em = merged.get("execution_mode") or "SCHEDULED"
     merged["execution_mode"] = em if em in ("SCHEDULED", "REAL_TIME") else "SCHEDULED"
-
     merged["search_window"] = merged.get("search_window") or "30 minutes"
     merged["simple_schedule"] = merged.get("simple_schedule") or "5 minutes"
     merged["timezone"] = merged.get("timezone") or "UTC"
     merged["crontab"] = merged.get("crontab") or "*/5 * * * *"
 
+    # dataset (string)
+    merged["dataset"] = merged.get("dataset") or "alerts"
+
+    # mapping_strategy enum
     ms = merged.get("mapping_strategy") or "AUTO"
     merged["mapping_strategy"] = ms if ms in ("AUTO", "CUSTOM") else "AUTO"
 
+    # lookup_mapping must be list
     merged["lookup_mapping"] = merged.get("lookup_mapping") if isinstance(merged.get("lookup_mapping"), list) else []
 
+    # suppression fields
     merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
     merged["suppression_duration"] = merged.get("suppression_duration") or "0 minutes"
     if merged.get("suppression_fields") is None:
         merged["suppression_fields"] = []
 
+    # drilldown timeframe enum
     dtf = merged.get("drilldown_query_timeframe")
     merged["drilldown_query_timeframe"] = dtf if dtf in ("ALERT", "QUERY") else "ALERT"
 
+    # mitre_defs must be dict/map
     merged["mitre_defs"] = merged.get("mitre_defs") if isinstance(merged.get("mitre_defs"), dict) else {}
 
+    # investigation query link: default to xql_query
     if not merged.get("investigation_query_link"):
         merged["investigation_query_link"] = merged["xql_query"]
 
+    # normalize user-defined fields: "" -> None
     if merged.get("user_defined_category") == "":
         merged["user_defined_category"] = None
     if merged.get("user_defined_severity") == "":
@@ -176,7 +213,7 @@ def normalize_correlation_payload(rule: dict) -> dict:
 
 
 # -----------------------------
-# XSIAM API client + response handling
+# XSIAM API client
 # -----------------------------
 
 class XsiamClient:
@@ -223,7 +260,7 @@ class XsiamClient:
             req["filters"] = filters
         return self.post("/public_api/v1/indicators/get", {"request_data": req})
 
-    def ioc_insert(self, iocs: List[dict]):
+    def ioc_insert(self, iocs: List[dict]) -> Dict[str, Any]:
         return self.post("/public_api/v1/indicators/insert", {"request_data": iocs})
 
     # BIOCs
@@ -233,7 +270,7 @@ class XsiamClient:
             req["filters"] = filters
         return self.post("/public_api/v1/bioc/get", {"request_data": req})
 
-    def bioc_insert(self, biocs: List[dict]):
+    def bioc_insert(self, biocs: List[dict]) -> Dict[str, Any]:
         return self.post("/public_api/v1/bioc/insert", {"request_data": biocs})
 
     # Correlations
@@ -243,9 +280,13 @@ class XsiamClient:
             req["filters"] = filters
         return self.post("/public_api/v1/correlations/get", {"request_data": req})
 
-    def corr_insert(self, rules: List[dict]):
+    def corr_insert(self, rules: List[dict]) -> Dict[str, Any]:
         return self.post("/public_api/v1/correlations/insert", {"request_data": rules})
 
+
+# -----------------------------
+# Result summarizer
+# -----------------------------
 
 def summarize_result(kind: str, res: Dict[str, Any]) -> None:
     added = res.get("added_objects", [])
@@ -358,7 +399,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             existing_id = find_existing_id_by_name(client, "bioc", name)
             o = dict(obj)
 
-            # Safest: omit rule_id on create (avoids "update 0" class of issues)
+            # safest: omit rule_id on create
             if existing_id:
                 o["rule_id"] = existing_id
             else:
@@ -381,7 +422,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             if not indicator or not ioc_type:
                 raise ValueError("IOC JSON must include 'indicator' and 'type'")
 
-            # indicators/get typically expects list values for indicator/type
+            # indicators/get typically expects list values
             filters = [
                 {"field": "indicator", "operator": "EQ", "value": [indicator]},
                 {"field": "type", "operator": "EQ", "value": [ioc_type]},
@@ -422,3 +463,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
