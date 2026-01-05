@@ -1,0 +1,10 @@
+correlation:
+  execution_mode: SCHEDULED
+  search_window: "30 minutes"
+  simple_schedule: "5 minutes"
+  timezone: "UTC"
+  alert_category: "OTHER"
+
+bioc:
+  type: "OTHER"
+  status: "enabled"

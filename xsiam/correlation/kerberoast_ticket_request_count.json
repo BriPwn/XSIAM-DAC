@@ -1,0 +1,18 @@
+{
+  "rule_id": 0,
+  "name": "SIGMA:NAME:kerberoast_ticket_request_count Kerberoast ticket request detected Count",
+  "severity": "SEV_040_HIGH",
+  "description": "Sigma correlation: value_count(IpAddress) >= 2 grouped by ServiceName over 30m for Kerberoast RC4 TGS requests.",
+  "is_enabled": true,
+  "execution_mode": "SCHEDULED",
+  "search_window": "30 minutes",
+  "simple_schedule": "5 minutes",
+  "timezone": "UTC",
+  "alert_category": "OTHER",
+  "alert_name": "Kerberoast (RC4) multi-source request count",
+  "xql_query": "dataset = microsoft_windows_raw\n| filter event_id = 4769\n| filter winlog.event_data.TicketEncryptionType = \"0x17\"\n| filter winlog.event_data.Status = \"0x0\"\n| filter not endswith(winlog.event_data.ServiceName, \"$\")\n| filter not winlog.event_data.ServiceSid = \"S-1-5-21-*-0\"\n| filter not endswith(winlog.event_data.ServiceSid, \"-502\")\n| filter not contains(winlog.event_data.TargetUserName, \"$@\")\n| filter not winlog.event_data.IpAddress in (\"::1\",\"127.0.0.1\",\"%domain_controllers_ips%\")\n| comp count_distinct(winlog.event_data.IpAddress) as ip_addr_count by winlog.event_data.ServiceName\n| filter ip_addr_count >= 2",
+  "alert_fields": {
+    "service_name": "winlog.event_data.ServiceName",
+    "ip_addr_count": "ip_addr_count"
+  }
+}
