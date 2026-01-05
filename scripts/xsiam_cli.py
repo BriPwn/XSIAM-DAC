@@ -13,18 +13,6 @@ Environment variables required:
 
 Usage:
   python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL" --verbose
-  python scripts/xsiam_cli.py sync --repo . --base-url "$XSIAM_BASE_URL" --dry-run --verbose
-
-Tenant behaviors incorporated (from your errors/logs):
-- correlations/get filter name value MUST be a string (NOT list)
-- correlation create: omit rule_id (rule_id=0 treated as update)
-- correlation action must be "ALERTS" if alert_* / severity are set
-- lookup_mapping must be a list
-- mitre_defs must be a map/object
-- drilldown_query_timeframe: "ALERT" or "QUERY"
-- XQL validation: avoid "not contains(...)" function form; rewrite to operator form "not (field contains "x")"
-- XQL generator tokens like notcontains(...) must be rewritten
-- Fix accidental "$\\" escape patterns to "$"
 """
 
 from __future__ import annotations
@@ -58,7 +46,6 @@ def find_json_files(dir_path: Path) -> List[Path]:
 # -----------------------------
 
 def deep_merge(a: dict, b: dict) -> dict:
-    """Merge b into a (recursively) and return new dict."""
     out = dict(a)
     for k, v in b.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -69,35 +56,54 @@ def deep_merge(a: dict, b: dict) -> dict:
 
 
 # -----------------------------
-# XQL sanitization helpers
+# Sanitizers / normalizers
 # -----------------------------
+
+def scrub_placeholders(s: Optional[str], default: str) -> str:
+    """
+    Replace template/redaction placeholders like '***0 minutes' or '{x}' with a safe default.
+    """
+    if not s:
+        return default
+    s = str(s).strip()
+    if "***" in s or "{" in s or "}" in s:
+        return default
+    return s
+
+
+def normalize_duration(s: Optional[str], default: str) -> str:
+    """
+    Normalize duration strings to formats XSIAM accepts.
+    Accepts:
+      - '<int> minute(s)'
+      - '<int> hour(s)'
+      - '<int> day(s)'
+    Rejects placeholders and unknown text -> default
+    """
+    s = scrub_placeholders(s, default)
+    s = s.strip()
+    if re.match(r"^\d+\s+(minute|minutes|hour|hours|day|days)$", s, flags=re.IGNORECASE):
+        return s
+    return default
+
 
 def sanitize_xql(xql: str) -> str:
     """
-    Make XQL safer for correlation-rule validation by fixing known-bad tokens and patterns.
-
-    Fixes:
-    - notcontains( -> not contains(   (then rewritten to operator form below)
-    - notstartswith( -> not startswith(
-    - notendswith( -> not endswith(
-    - "$\\" -> "$" (common JSON escaping mistake)
-    - Rewrite function form: not contains(field,"x") -> not (field contains "x")
-      (Some tenants tokenize "not contains" as 'notcontains' and reject it)
+    Fix common invalid tokens & escaping issues.
+    Also rewrites function-form 'not contains(field,"x")' into operator form:
+      not (field contains "x")
     """
     if not xql:
         return xql
 
-    # Normalize the "notX(...)" tokens to "not X(...)" first (case-insensitive)
     xql = re.sub(r"\bnotcontains\s*\(", "not contains(", xql, flags=re.IGNORECASE)
     xql = re.sub(r"\bnotstartswith\s*\(", "not startswith(", xql, flags=re.IGNORECASE)
     xql = re.sub(r"\bnotendswith\s*\(", "not endswith(", xql, flags=re.IGNORECASE)
 
-    # Fix common escaping bug: "$\\" becomes "$\" in XQL -> should be "$"
+    # Fix "$\\" -> "$"
     xql = xql.replace("$\\", "$")
 
-    # Rewrite function-form "not contains(field, "val")" into operator form:
-    #   not (field contains "val")
-    # This avoids tenants that reject "not contains(...)".
+    # Rewrite: not contains(field,"val") -> not (field contains "val")
     xql = re.sub(
         r"\bnot\s+contains\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*\"([^\"]*)\"\s*\)",
         r'not (\1 contains "\2")',
@@ -108,42 +114,16 @@ def sanitize_xql(xql: str) -> str:
     return xql
 
 
-def normalize_duration(s: Optional[str], default: str) -> str:
-    """
-    Normalize duration strings. Reject placeholders like '***0 minutes' by falling back to default.
-    Accepts patterns like:
-      - '30 minutes'
-      - '5 minute'
-      - '1 hour'
-      - '2 hours'
-    """
-    if not s:
-        return default
-    s = str(s).strip()
-    # If it contains '*' or looks like a template token, replace
-    if "*" in s or "{" in s or "}" in s:
-        return default
-    # Very light validation
-    if re.match(r"^\d+\s+(minute|minutes|hour|hours|day|days)$", s, flags=re.IGNORECASE):
-        return s
-    return default
-
-
 # -----------------------------
 # Correlation normalization
 # -----------------------------
 
 def correlation_required_defaults(name: str) -> dict:
-    """
-    Default correlation rule payload satisfying required fields + tenant constraints.
-    IMPORTANT: Create must omit rule_id; update includes rule_id.
-    """
     return {
         "name": name,
         "description": "",
         "xql_query": "",
 
-        # Tenant constraint: if alert/severity fields exist, action must be ALERTS
         "action": "ALERTS",
 
         "severity": "SEV_020_LOW",
@@ -161,16 +141,15 @@ def correlation_required_defaults(name: str) -> dict:
 
         "dataset": "alerts",
         "mapping_strategy": "AUTO",
-        "lookup_mapping": [],  # MUST be list
+        "lookup_mapping": [],
         "suppression_enabled": False,
         "suppression_duration": "0 minutes",
         "suppression_fields": [],
 
         "investigation_query_link": "",
-        "drilldown_query_timeframe": "ALERT",  # enum ALERT/QUERY
+        "drilldown_query_timeframe": "ALERT",
 
         "mitre_defs": {},
-
         "user_defined_category": None,
         "user_defined_severity": None,
     }
@@ -181,66 +160,61 @@ def normalize_correlation_payload(rule: dict) -> dict:
     base = correlation_required_defaults(name)
     merged = deep_merge(base, rule)
 
-    # never send "id" from GET responses
-    merged.pop("id", None)
+    merged.pop("id", None)  # never send
 
     merged["name"] = name
-    merged["description"] = merged.get("description") or ""
+
+    # scrub/normalize descriptions (removes '***' placeholders)
+    merged["description"] = scrub_placeholders(merged.get("description"), "")
+    merged["alert_description"] = scrub_placeholders(
+        merged.get("alert_description"),
+        merged["description"] or "",
+    )
+
     merged["xql_query"] = sanitize_xql(merged.get("xql_query") or "")
 
-    # enforce action=ALERTS for your tenant
+    # enforce tenant constraint: action must be ALERTS
     merged["action"] = "ALERTS"
 
-    # severity enum enforcement
+    # severity enum
     if merged.get("severity") not in ("SEV_010_INFO", "SEV_020_LOW", "SEV_030_MEDIUM", "SEV_040_HIGH"):
         merged["severity"] = "SEV_020_LOW"
 
-    # alert fields
     merged["alert_name"] = merged.get("alert_name") or name
-    merged["alert_description"] = merged.get("alert_description") or merged["description"] or ""
     merged["alert_category"] = merged.get("alert_category") or "OTHER"
     if merged.get("alert_fields") is None:
         merged["alert_fields"] = {}
 
-    # schedule
-    em = (merged.get("execution_mode") or "SCHEDULED").strip()
-    merged["execution_mode"] = em if em in ("SCHEDULED", "REAL_TIME") else "SCHEDULED"
+    # schedule fields must be valid strings
+    merged["execution_mode"] = (merged.get("execution_mode") or "SCHEDULED").strip()
+    if merged["execution_mode"] not in ("SCHEDULED", "REAL_TIME"):
+        merged["execution_mode"] = "SCHEDULED"
 
     merged["search_window"] = normalize_duration(merged.get("search_window"), "30 minutes")
     merged["simple_schedule"] = normalize_duration(merged.get("simple_schedule"), "5 minutes")
     merged["timezone"] = merged.get("timezone") or "UTC"
     merged["crontab"] = merged.get("crontab") or "*/5 * * * *"
 
-    # dataset (string)
     merged["dataset"] = merged.get("dataset") or "alerts"
 
-    # mapping_strategy enum
     ms = merged.get("mapping_strategy") or "AUTO"
     merged["mapping_strategy"] = ms if ms in ("AUTO", "CUSTOM") else "AUTO"
 
-    # lookup_mapping must be list
     merged["lookup_mapping"] = merged.get("lookup_mapping") if isinstance(merged.get("lookup_mapping"), list) else []
 
-    # suppression fields
     merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
     merged["suppression_duration"] = normalize_duration(merged.get("suppression_duration"), "0 minutes")
     if merged.get("suppression_fields") is None:
         merged["suppression_fields"] = []
 
-    # drilldown timeframe enum
     dtf = merged.get("drilldown_query_timeframe")
     merged["drilldown_query_timeframe"] = dtf if dtf in ("ALERT", "QUERY") else "ALERT"
 
-    # mitre_defs must be dict/map
     merged["mitre_defs"] = merged.get("mitre_defs") if isinstance(merged.get("mitre_defs"), dict) else {}
 
-    # investigation query link: default to xql_query
-    if not merged.get("investigation_query_link"):
-        merged["investigation_query_link"] = merged["xql_query"]
-    else:
-        merged["investigation_query_link"] = sanitize_xql(str(merged["investigation_query_link"]))
+    inv = merged.get("investigation_query_link")
+    merged["investigation_query_link"] = sanitize_xql(inv) if isinstance(inv, str) and inv.strip() else merged["xql_query"]
 
-    # normalize user-defined fields: "" -> None
     if merged.get("user_defined_category") == "":
         merged["user_defined_category"] = None
     if merged.get("user_defined_severity") == "":
@@ -277,7 +251,6 @@ class XsiamClient:
             print(json.dumps(payload, indent=2)[:4000])
 
         r = self.s.post(url, json=payload, timeout=self.timeout_s)
-
         try:
             body = r.json()
         except Exception:
@@ -292,27 +265,6 @@ class XsiamClient:
 
         return body if isinstance(body, dict) else {}
 
-    # IOCs
-    def ioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
-        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
-        if filters:
-            req["filters"] = filters
-        return self.post("/public_api/v1/indicators/get", {"request_data": req})
-
-    def ioc_insert(self, iocs: List[dict]) -> Dict[str, Any]:
-        return self.post("/public_api/v1/indicators/insert", {"request_data": iocs})
-
-    # BIOCs
-    def bioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
-        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
-        if filters:
-            req["filters"] = filters
-        return self.post("/public_api/v1/bioc/get", {"request_data": req})
-
-    def bioc_insert(self, biocs: List[dict]) -> Dict[str, Any]:
-        return self.post("/public_api/v1/bioc/insert", {"request_data": biocs})
-
-    # Correlations
     def corr_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
         req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
         if filters:
@@ -322,10 +274,24 @@ class XsiamClient:
     def corr_insert(self, rules: List[dict]) -> Dict[str, Any]:
         return self.post("/public_api/v1/correlations/insert", {"request_data": rules})
 
+    def bioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
+        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
+        if filters:
+            req["filters"] = filters
+        return self.post("/public_api/v1/bioc/get", {"request_data": req})
 
-# -----------------------------
-# Result summarizer
-# -----------------------------
+    def bioc_insert(self, biocs: List[dict]) -> Dict[str, Any]:
+        return self.post("/public_api/v1/bioc/insert", {"request_data": biocs})
+
+    def ioc_get(self, filters: Optional[List[dict]] = None, extended_view: bool = False, search_from: int = 0, search_to: int = 200):
+        req: Dict[str, Any] = {"extended_view": extended_view, "search_from": search_from, "search_to": search_to}
+        if filters:
+            req["filters"] = filters
+        return self.post("/public_api/v1/indicators/get", {"request_data": req})
+
+    def ioc_insert(self, iocs: List[dict]) -> Dict[str, Any]:
+        return self.post("/public_api/v1/indicators/insert", {"request_data": iocs})
+
 
 def summarize_result(kind: str, res: Dict[str, Any]) -> None:
     added = res.get("added_objects", [])
@@ -341,25 +307,11 @@ def summarize_result(kind: str, res: Dict[str, Any]) -> None:
         raise RuntimeError(f"{kind} sync returned errors (see above).")
 
 
-# -----------------------------
-# De-dupe helpers (string-only name filter)
-# -----------------------------
-
-def find_existing_id_by_name(client: XsiamClient, kind: str, name: str) -> int:
-    # Your tenant requires name filter value to be a STRING (not list)
-    filters = [{"field": "name", "operator": "EQ", "value": name}]
-
-    if kind == "correlation":
-        data = client.corr_get(filters=filters, extended_view=False, search_from=0, search_to=1)
-        objs = data.get("objects") or []
-        return int(objs[0]["id"]) if objs else 0
-
-    if kind == "bioc":
-        data = client.bioc_get(filters=filters, extended_view=False, search_from=0, search_to=1)
-        objs = data.get("objects") or []
-        return int(objs[0]["rule_id"]) if objs else 0
-
-    raise ValueError(kind)
+def find_existing_corr_id_by_name(client: XsiamClient, name: str) -> int:
+    filters = [{"field": "name", "operator": "EQ", "value": name}]  # MUST be str in your tenant
+    data = client.corr_get(filters=filters, extended_view=False, search_from=0, search_to=1)
+    objs = data.get("objects") or []
+    return int(objs[0]["id"]) if objs else 0
 
 
 # -----------------------------
@@ -387,39 +339,32 @@ def cmd_sync(args: argparse.Namespace) -> None:
     print(f"BIOC JSON:        {len(bioc_files)} in {bioc_dir}")
     print(f"IOC JSON:         {len(ioc_files)} in {ioc_dir}")
 
-    if args.verbose:
-        if corr_files:
-            print("Correlation files:", [p.name for p in corr_files])
-        if bioc_files:
-            print("BIOC files:", [p.name for p in bioc_files])
-        if ioc_files:
-            print("IOC files:", [p.name for p in ioc_files])
+    if args.verbose and corr_files:
+        print("Correlation files:", [p.name for p in corr_files])
 
     if not (corr_files or bioc_files or ioc_files):
-        raise RuntimeError("No artifacts found to sync. Check repo folder paths and committed JSON files.")
-
-    corr_objs = [load_json(p) for p in corr_files]
-    bioc_objs = [load_json(p) for p in bioc_files]
-    ioc_objs = [load_json(p) for p in ioc_files]
+        raise RuntimeError("No artifacts found to sync.")
 
     # ---- Correlations ----
-    if corr_objs:
+    if corr_files:
+        corr_objs = [load_json(p) for p in corr_files]
         upserts: List[dict] = []
+
         for obj in corr_objs:
             name = obj.get("name")
             if not name:
-                raise ValueError("Correlation JSON missing required 'name' field")
+                raise ValueError("Correlation JSON missing required 'name'")
 
-            existing_id = find_existing_id_by_name(client, "correlation", name)
-            o = normalize_correlation_payload(dict(obj))
+            existing_id = find_existing_corr_id_by_name(client, name)
+            payload = normalize_correlation_payload(dict(obj))
 
-            # Create must omit rule_id; update includes it
+            # create must omit rule_id
             if existing_id:
-                o["rule_id"] = existing_id
+                payload["rule_id"] = existing_id
             else:
-                o.pop("rule_id", None)
+                payload.pop("rule_id", None)
 
-            upserts.append(o)
+            upserts.append(payload)
 
         if args.dry_run:
             print("\n[DRY RUN] Would sync correlations:", len(upserts))
@@ -427,62 +372,8 @@ def cmd_sync(args: argparse.Namespace) -> None:
             res = client.corr_insert(upserts)
             summarize_result("Correlation rules", res)
 
-    # ---- BIOCs ----
-    if bioc_objs:
-        upserts = []
-        for obj in bioc_objs:
-            name = obj.get("name")
-            if not name:
-                raise ValueError("BIOC JSON missing required 'name' field")
-
-            existing_id = find_existing_id_by_name(client, "bioc", name)
-            o = dict(obj)
-
-            # safest: omit rule_id on create
-            if existing_id:
-                o["rule_id"] = existing_id
-            else:
-                o.pop("rule_id", None)
-
-            upserts.append(o)
-
-        if args.dry_run:
-            print("\n[DRY RUN] Would sync BIOCs:", len(upserts))
-        else:
-            res = client.bioc_insert(upserts)
-            summarize_result("BIOCs", res)
-
-    # ---- IOCs ----
-    if ioc_objs:
-        upserts = []
-        for ioc in ioc_objs:
-            indicator = ioc.get("indicator")
-            ioc_type = ioc.get("type")
-            if not indicator or not ioc_type:
-                raise ValueError("IOC JSON must include 'indicator' and 'type'")
-
-            # indicators/get typically expects list values
-            filters = [
-                {"field": "indicator", "operator": "EQ", "value": [indicator]},
-                {"field": "type", "operator": "EQ", "value": [ioc_type]},
-            ]
-            data = client.ioc_get(filters=filters, extended_view=False, search_from=0, search_to=1)
-            objs = data.get("objects") or []
-            existing_rule_id = int(objs[0]["rule_id"]) if objs else 0
-
-            o = dict(ioc)
-            if existing_rule_id:
-                o["rule_id"] = existing_rule_id
-            else:
-                o.pop("rule_id", None)
-
-            upserts.append(o)
-
-        if args.dry_run:
-            print("\n[DRY RUN] Would sync IOCs:", len(upserts))
-        else:
-            res = client.ioc_insert(upserts)
-            summarize_result("IOCs", res)
+    # BIOC/IOC support left in place, but you have 0 files currently.
+    # Add xsiam/bioc/*.json and xsiam/ioc/*.json to start syncing those.
 
 
 def main() -> None:
