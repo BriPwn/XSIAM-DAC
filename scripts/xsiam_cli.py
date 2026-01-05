@@ -22,8 +22,9 @@ Tenant behaviors incorporated (from your errors/logs):
 - lookup_mapping must be a list
 - mitre_defs must be a map/object
 - drilldown_query_timeframe: "ALERT" or "QUERY"
-- XQL generator tokens like notcontains(...) must be rewritten to "not contains(...)"
-- Bad escape patterns like "$\\" should be corrected to "$"
+- XQL validation: avoid "not contains(...)" function form; rewrite to operator form "not (field contains "x")"
+- XQL generator tokens like notcontains(...) must be rewritten
+- Fix accidental "$\\" escape patterns to "$"
 """
 
 from __future__ import annotations
@@ -73,24 +74,59 @@ def deep_merge(a: dict, b: dict) -> dict:
 
 def sanitize_xql(xql: str) -> str:
     """
-    Make XQL safe for correlation rule validation by fixing common invalid tokens and escapes.
-    - notcontains( -> not contains(
+    Make XQL safer for correlation-rule validation by fixing known-bad tokens and patterns.
+
+    Fixes:
+    - notcontains( -> not contains(   (then rewritten to operator form below)
     - notstartswith( -> not startswith(
     - notendswith( -> not endswith(
-    - fix accidental "$\\" sequence to "$" (common JSON escaping mistake)
+    - "$\\" -> "$" (common JSON escaping mistake)
+    - Rewrite function form: not contains(field,"x") -> not (field contains "x")
+      (Some tenants tokenize "not contains" as 'notcontains' and reject it)
     """
     if not xql:
         return xql
 
-    # normalize common bad composite tokens (case-insensitive)
+    # Normalize the "notX(...)" tokens to "not X(...)" first (case-insensitive)
     xql = re.sub(r"\bnotcontains\s*\(", "not contains(", xql, flags=re.IGNORECASE)
     xql = re.sub(r"\bnotstartswith\s*\(", "not startswith(", xql, flags=re.IGNORECASE)
     xql = re.sub(r"\bnotendswith\s*\(", "not endswith(", xql, flags=re.IGNORECASE)
 
-    # fix a very common escaping bug: "$\\" becomes "$\" in XQL -> should be "$"
+    # Fix common escaping bug: "$\\" becomes "$\" in XQL -> should be "$"
     xql = xql.replace("$\\", "$")
 
+    # Rewrite function-form "not contains(field, "val")" into operator form:
+    #   not (field contains "val")
+    # This avoids tenants that reject "not contains(...)".
+    xql = re.sub(
+        r"\bnot\s+contains\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*\"([^\"]*)\"\s*\)",
+        r'not (\1 contains "\2")',
+        xql,
+        flags=re.IGNORECASE,
+    )
+
     return xql
+
+
+def normalize_duration(s: Optional[str], default: str) -> str:
+    """
+    Normalize duration strings. Reject placeholders like '***0 minutes' by falling back to default.
+    Accepts patterns like:
+      - '30 minutes'
+      - '5 minute'
+      - '1 hour'
+      - '2 hours'
+    """
+    if not s:
+        return default
+    s = str(s).strip()
+    # If it contains '*' or looks like a template token, replace
+    if "*" in s or "{" in s or "}" in s:
+        return default
+    # Very light validation
+    if re.match(r"^\d+\s+(minute|minutes|hour|hours|day|days)$", s, flags=re.IGNORECASE):
+        return s
+    return default
 
 
 # -----------------------------
@@ -167,10 +203,11 @@ def normalize_correlation_payload(rule: dict) -> dict:
         merged["alert_fields"] = {}
 
     # schedule
-    em = merged.get("execution_mode") or "SCHEDULED"
+    em = (merged.get("execution_mode") or "SCHEDULED").strip()
     merged["execution_mode"] = em if em in ("SCHEDULED", "REAL_TIME") else "SCHEDULED"
-    merged["search_window"] = merged.get("search_window") or "30 minutes"
-    merged["simple_schedule"] = merged.get("simple_schedule") or "5 minutes"
+
+    merged["search_window"] = normalize_duration(merged.get("search_window"), "30 minutes")
+    merged["simple_schedule"] = normalize_duration(merged.get("simple_schedule"), "5 minutes")
     merged["timezone"] = merged.get("timezone") or "UTC"
     merged["crontab"] = merged.get("crontab") or "*/5 * * * *"
 
@@ -186,7 +223,7 @@ def normalize_correlation_payload(rule: dict) -> dict:
 
     # suppression fields
     merged["suppression_enabled"] = bool(merged.get("suppression_enabled", False))
-    merged["suppression_duration"] = merged.get("suppression_duration") or "0 minutes"
+    merged["suppression_duration"] = normalize_duration(merged.get("suppression_duration"), "0 minutes")
     if merged.get("suppression_fields") is None:
         merged["suppression_fields"] = []
 
@@ -200,6 +237,8 @@ def normalize_correlation_payload(rule: dict) -> dict:
     # investigation query link: default to xql_query
     if not merged.get("investigation_query_link"):
         merged["investigation_query_link"] = merged["xql_query"]
+    else:
+        merged["investigation_query_link"] = sanitize_xql(str(merged["investigation_query_link"]))
 
     # normalize user-defined fields: "" -> None
     if merged.get("user_defined_category") == "":
@@ -463,4 +502,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
