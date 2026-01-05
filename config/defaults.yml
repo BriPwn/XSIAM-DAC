@@ -4,6 +4,7 @@ correlation:
   simple_schedule: "5 minutes"
   timezone: "UTC"
   alert_category: "OTHER"
+  "lookup_mapping": []
 
 bioc:
   type: "OTHER"
