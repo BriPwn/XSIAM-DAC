@@ -3,7 +3,7 @@
   "severity": "SEV_040_HIGH",
   "description": "Sigma correlation: value_count(IpAddress) >= 2 grouped by ServiceName over 30m for Kerberoast RC4 TGS requests.",
   "alert_description": "Multiple distinct source IPs requested RC4 Kerberos service tickets for the same service within 30 minutes.",
-  "dataset": "microsoft_windows_raw",
+  "dataset": "xdr_data",
   "is_enabled": true,
   "execution_mode": "SCHEDULED",
   "search_window": "30 minutes",
@@ -11,10 +11,11 @@
   "timezone": "UTC",
   "alert_category": "OTHER",
   "alert_name": "Kerberoast (RC4) multi-source request count",
-  "xql_query": "dataset = microsoft_windows_raw\n| alter IpAddress = winlog.event_data.IpAddress, ServiceName = winlog.event_data.ServiceName, TicketEncryptionType = winlog.event_data.TicketEncryptionType, Status = winlog.event_data.Status, ServiceSid = winlog.event_data.ServiceSid, TargetUserName = winlog.event_data.TargetUserName\n| filter event_id = 4769\n| filter TicketEncryptionType = \"0x17\"\n| filter Status = \"0x0\"\n| filter not endswith(ServiceName, \"$\")\n| filter not ServiceSid = \"S-1-5-21-*-0\"\n| filter not endswith(ServiceSid, \"-502\")\n| filter not contains(TargetUserName, \"$@\")\n| filter not IpAddress in (\"::1\",\"127.0.0.1\",\"%domain_controllers_ips%\")\n| comp count_distinct(IpAddress) as ip_addr_count by ServiceName\n| filter ip_addr_count >= 2",
+  "xql_query": "dataset = xdr_data\n| filter event_id = 4769\n| filter ticket_encryption_type = \"0x17\"\n| filter status = \"0x0\"\n| filter not endswith(service_name, \"$\\\")\n| filter not service_sid = \"S-1-5-21-*-0\"\n| filter not endswith(service_sid, \"-502\")\n| filter not contains(target_user_name, \"$@\")\n| filter not ip_address in (\"::1\",\"127.0.0.1\",\"%domain_controllers_ips%\")\n| comp count_distinct(ip_address) as ip_addr_count by service_name\n| filter ip_addr_count >= 2",
   "alert_fields": {
-    "service_name": "ServiceName",
+    "service_name": "service_name",
     "ip_addr_count": "ip_addr_count"
   }
 }
+
 
