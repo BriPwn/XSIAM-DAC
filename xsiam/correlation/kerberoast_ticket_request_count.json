@@ -3,6 +3,8 @@
   "name": "SIGMA:NAME:kerberoast_ticket_request_count Kerberoast ticket request detected Count",
   "severity": "SEV_040_HIGH",
   "description": "Sigma correlation: value_count(IpAddress) >= 2 grouped by ServiceName over 30m for Kerberoast RC4 TGS requests.",
+  "alert_description": "Multiple distinct source IPs requested RC4 Kerberos service tickets for the same service within 30 minutes.",
+  "dataset": "microsoft_windows_raw",
   "is_enabled": true,
   "execution_mode": "SCHEDULED",
   "search_window": "30 minutes",
