@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Sigma -> XQL + XSIAM Correlation payload generator (robust)
+Sigma -> XQL + XSIAM Correlation payload generator (robust, CI-safe)
 
-Key features:
+This version:
 - Supports Sigma YAML files containing MULTIPLE documents separated by '---'
 - Converts each document independently by writing it to a temp single-rule YAML
-- Uses Sigma2XSIAM's converter script (subprocess) to avoid Python packaging collisions
+- Uses Sigma2XSIAM's converter script via subprocess to avoid Python package collisions
+- Runs converter with cwd=SIGMA2XSIAM_DIR so it can find pipelines/cortex_xdm.yml
 - Outputs:
   - generated/xql/<safe_name>.xql
   - generated/correlations/<safe_name>.json
-- Adds managed scope controls:
+- Applies managed scoping:
   - Name prefix (DAC_PREFIX)
-  - Marker string in description (DAC_MARKER)
+  - Marker in description (DAC_MARKER)
 
 Environment variables:
 - DAC_PREFIX: default "DAC: "
@@ -41,7 +42,7 @@ DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 
 SIGMA2XSIAM_DIR = Path(os.getenv("SIGMA2XSIAM_DIR", "vendor/Sigma2XSIAM"))
 CONVERTER = SIGMA2XSIAM_DIR / "convert_rule.py"
-PIPELINE_YML = SIGMA2XSIAM_DIR / "pipelines" / "cortex_xdm.yml"
+PIPELINE_REL = Path("pipelines") / "cortex_xdm.yml"
 
 
 def sigma_level_to_xsiam(level: str | None) -> str:
@@ -55,17 +56,21 @@ def sanitize_filename(name: str) -> str:
 
 
 def ensure_vendor_present() -> None:
+    if not SIGMA2XSIAM_DIR.exists():
+        raise SystemExit(
+            f"Sigma2XSIAM directory not found: {SIGMA2XSIAM_DIR}. "
+            f"Workflow must clone Sigma2XSIAM into this path."
+        )
     if not CONVERTER.exists():
         raise SystemExit(
             f"Missing Sigma2XSIAM converter at {CONVERTER}. "
             f"Workflow must clone Sigma2XSIAM into {SIGMA2XSIAM_DIR}."
         )
-    # The pipeline file is referenced by Sigma2XSIAM; keep check as a sanity guard.
-    if not PIPELINE_YML.exists():
-        # Not all forks keep identical paths, but most do.
+    pipeline_path = SIGMA2XSIAM_DIR / PIPELINE_REL
+    if not pipeline_path.exists():
         raise SystemExit(
-            f"Missing pipeline file at {PIPELINE_YML}. "
-            f"Ensure the Sigma2XSIAM repo includes pipelines/cortex_xdm.yml."
+            f"Missing pipeline file at {pipeline_path}. "
+            f"Sigma2XSIAM converter expects {PIPELINE_REL} relative to its working directory."
         )
 
 
@@ -73,17 +78,26 @@ def convert_one_sigma(single_rule_path: Path, out_path: Path) -> str:
     """
     Invoke Sigma2XSIAM converter for a single Sigma rule YAML file.
 
-    We rely on -r (rule path) and -o (output file) arguments supported by the converter.
+    The converter expects pipelines/cortex_xdm.yml relative to its CWD,
+    so we run it with cwd=SIGMA2XSIAM_DIR and pass absolute file paths.
     """
+    rule_abs = single_rule_path.resolve()
+    out_abs = out_path.resolve()
+
     cmd = [
         "python",
-        str(CONVERTER),
+        "convert_rule.py",
         "-r",
-        str(single_rule_path),
+        str(rule_abs),
         "-o",
-        str(out_path),
+        str(out_abs),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(SIGMA2XSIAM_DIR),
+        capture_output=True,
+        text=True,
+    )
     if proc.returncode != 0:
         raise SystemExit(
             f"Conversion failed for {single_rule_path}\n"
@@ -91,10 +105,10 @@ def convert_one_sigma(single_rule_path: Path, out_path: Path) -> str:
             f"STDERR:\n{proc.stderr}\n"
         )
 
-    if not out_path.exists():
-        raise SystemExit(f"Converter did not produce output file: {out_path}")
+    if not out_abs.exists():
+        raise SystemExit(f"Converter did not produce output file: {out_abs}")
 
-    return out_path.read_text(encoding="utf-8").strip()
+    return out_abs.read_text(encoding="utf-8").strip()
 
 
 def load_yaml_documents(raw: str, src: Path) -> List[Dict[str, Any]]:
@@ -118,7 +132,7 @@ def derive_rule_name(rule_dict: Dict[str, Any], fallback: str) -> str:
     """
     Prefer Sigma 'title', fallback to 'id', then fallback string.
     """
-    raw_name = (rule_dict.get("title") or rule_dict.get("id") or fallback)
+    raw_name = rule_dict.get("title") or rule_dict.get("id") or fallback
     raw_name = str(raw_name).strip()
     if not raw_name:
         raw_name = fallback
@@ -127,7 +141,7 @@ def derive_rule_name(rule_dict: Dict[str, Any], fallback: str) -> str:
 
 def apply_managed_scoping(name: str, description: str) -> tuple[str, str]:
     """
-    Apply prefix + marker.
+    Apply prefix + marker to ensure safe reconciliation scoping.
     """
     if not name.startswith(DAC_PREFIX):
         name = f"{DAC_PREFIX}{name}"
@@ -213,7 +227,8 @@ def main() -> None:
             }
 
             (out_corr_dir / f"{safe}.json").write_text(
-                json.dumps(corr_payload, indent=2) + "\n", encoding="utf-8"
+                json.dumps(corr_payload, indent=2) + "\n",
+                encoding="utf-8",
             )
 
             print(f"Converted: {rule_path} (doc {idx}/{len(docs)}) -> {safe}.xql + {safe}.json")
@@ -221,3 +236,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
