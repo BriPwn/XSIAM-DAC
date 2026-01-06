@@ -1,7 +1,11 @@
 requests==2.32.3
 PyYAML==6.0.2
+
+# Sigma core
 pysigma==0.11.16
 
-# XSIAM-focused backend
-git+https://github.com/gocortexio/sigma2xsiam.git
+# REQUIRED: pySigma is not compatible with pyparsing 3.x
+pyparsing<3.0.0
 
+# XSIAM-focused Sigma backend
+git+https://github.com/gocortexio/sigma2xsiam.git
