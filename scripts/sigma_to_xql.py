@@ -192,7 +192,6 @@ def main() -> None:
 
             # Build FULL required correlation payload (per your tenant error message)
             corr_payload = {
-                "rule_id": 0,
                 "name": name,
                 "description": desc,
 
