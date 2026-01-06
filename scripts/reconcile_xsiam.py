@@ -1,36 +1,5 @@
 #!/usr/bin/env python3
 # scripts/reconcile_xsiam.py
-"""
-Full reconciliation for Cortex XSIAM (Git = source of truth)
-
-Manages:
-- Correlation rules (by name) from generated/correlations/*.json
-- BIOCs (by name) from rules/biocs/biocs.yaml
-- IOCs (by (type, indicator)) from rules/iocs/iocs.yaml
-
-Behavior:
-- Create if missing
-- Update if changed (idempotent compare on managed keys)
-- Delete if remote object is managed-by-this-pipeline AND missing from desired state
-
-Reliability:
-- Normalizes XSIAM_FQDN so it can be either a bare host or a full https:// URL
-- Retries on transient network errors and 429/5xx/599
-- **Fix applied:** XSIAM paging constraint enforced: 1 <= search_size <= 100
-- **Fix applied:** Non-retryable 599 handling when body indicates a deterministic client error
-- FAILS if API returns errors/failures in JSON even when HTTP=200
-
-Env vars:
-Required:
-- XSIAM_FQDN  (either api-tenant.xdr... OR https://api-tenant.xdr...)
-- XSIAM_API_KEY
-- XSIAM_API_KEY_ID
-
-Optional:
-- DAC_PREFIX (default "DAC: ")
-- DAC_MARKER (default "Managed by detections-as-code")
-- DRY_RUN    (default "false")
-"""
 
 from __future__ import annotations
 
@@ -61,12 +30,6 @@ def must_env(name: str) -> str:
 
 
 def normalize_base_url(fqdn_or_url: str) -> str:
-    """
-    Accepts either:
-      - api-tenant.xdr.us.paloaltonetworks.com
-      - https://api-tenant.xdr.us.paloaltonetworks.com
-    Returns a clean base URL with no trailing slash.
-    """
     v = fqdn_or_url.strip()
     if v.startswith("http://") or v.startswith("https://"):
         return v.rstrip("/")
@@ -82,7 +45,6 @@ def normalize_value(v: Any) -> Any:
     if isinstance(v, str):
         return v.strip()
     if isinstance(v, list):
-        # sort simple lists for deterministic compare
         if all(not isinstance(x, dict) for x in v):
             return sorted(normalize_value(x) for x in v)
         return [normalize_value(x) for x in v]
@@ -101,7 +63,6 @@ def is_managed_by_pipeline(name: str, text_field: str) -> bool:
 
 
 def parse_objects(resp: dict) -> List[dict]:
-    # common patterns in Cortex APIs
     if isinstance(resp.get("objects"), list):
         return resp["objects"]
     rep = resp.get("reply")
@@ -123,10 +84,6 @@ def parse_objects_count(resp: dict) -> Optional[int]:
 
 
 def raise_on_api_errors(endpoint: str, resp: dict) -> None:
-    """
-    Fail the run if API indicates errors/failures, even if HTTP 200.
-    This prevents "pipeline succeeded but nothing changed".
-    """
     errors = resp.get("errors") or []
     if errors:
         raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
@@ -135,15 +92,15 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
     if failures:
         raise SystemExit(f"XSIAM API returned failures for {endpoint}: {failures}")
 
-    # Some Cortex APIs use reply.err_code/err_msg for failures
     rep = resp.get("reply")
     if isinstance(rep, dict):
         err_code = rep.get("err_code")
         if isinstance(err_code, int) and err_code != 0:
-            # This is a generic "error wrapper" many endpoints use
             err_msg = rep.get("err_msg")
             err_extra = rep.get("err_extra")
-            raise SystemExit(f"XSIAM API error for {endpoint}: err_code={err_code} err_msg={err_msg} err_extra={err_extra}")
+            raise SystemExit(
+                f"XSIAM API error for {endpoint}: err_code={err_code} err_msg={err_msg} err_extra={err_extra}"
+            )
 
     if resp.get("success") is False:
         raise SystemExit(f"XSIAM API indicates success=false for {endpoint}: {resp}")
@@ -153,17 +110,12 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
 # HTTP with retries
 # ----------------------------
 def _is_non_retryable_599(body_json: dict) -> bool:
-    """
-    XSIAM sometimes returns deterministic validation errors with HTTP 599.
-    If so, retries will never fix it.
-    """
     rep = body_json.get("reply") if isinstance(body_json, dict) else None
     if not isinstance(rep, dict):
         return False
     extra = rep.get("err_extra") or ""
     msg = rep.get("err_msg") or ""
     combined = f"{msg} {extra}".lower()
-    # Add patterns here as you discover them
     if "search size" in combined or "search_size" in combined:
         return True
     return False
@@ -172,26 +124,32 @@ def _is_non_retryable_599(body_json: dict) -> bool:
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
     url = f"{base_url}{path}"
 
-    # Dry run should still read remote state; only skip mutations
     if DRY_RUN and (path.endswith("/insert") or path.endswith("/delete")):
         return {"dry_run": True, "path": path, "payload": payload, "errors": []}
 
     last_exc: Exception | None = None
     for attempt in range(1, 6):
         try:
-            r = session.post(url, json=payload, timeout=(10, 180))  # (connect, read)
+            r = session.post(url, json=payload, timeout=(10, 180))  # connect/read
 
-            # Handle "weird" 599 that actually contains a deterministic error body
+            # 599 can be either transient LB/proxy OR a deterministic JSON validation error
             if r.status_code == 599:
                 try:
                     j = r.json()
                     if _is_non_retryable_599(j):
                         raise SystemExit(f"Non-retryable XSIAM 599 error from {url}: {j}")
                 except ValueError:
-                    # Not JSON; treat as retryable below
                     pass
 
-            # Retry-worthy HTTP statuses (including 599 emitted by some proxies/LBs)
+            # If XSIAM returns a 4xx (except 429), don't retry—surface body immediately
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                body = (r.text or "")[:2000]
+                raise SystemExit(
+                    f"Non-retryable HTTP {r.status_code} from {url}\n"
+                    f"Response body (first 2000 chars):\n{body}"
+                )
+
+            # Retry-worthy HTTP statuses
             if r.status_code in (429, 500, 502, 503, 504, 599):
                 body = (r.text or "")[:800]
                 raise HTTPError(
@@ -201,19 +159,18 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
 
             r.raise_for_status()
 
-            # Some APIs may return non-json on error; raise to surface it
             try:
                 data = r.json()
             except Exception:
-                raise SystemExit(f"Non-JSON response from {url} (status {r.status_code}): {(r.text or '')[:800]}")
+                raise SystemExit(
+                    f"Non-JSON response from {url} (status {r.status_code}): {(r.text or '')[:2000]}"
+                )
 
             raise_on_api_errors(path, data)
             return data
 
         except SystemExit:
-            # Non-retryable deterministic validation error
             raise
-
         except (ConnectionError, Timeout, HTTPError) as e:
             last_exc = e
             if attempt < 5:
@@ -231,12 +188,8 @@ def paged_get_all(
     base_url: str,
     endpoint: str,
     extended_view: bool = True,
-    page_size: int = 100,  # <-- IMPORTANT: XSIAM requires 1..100 (search_size constraint)
+    page_size: int = 100,
 ) -> List[dict]:
-    """
-    Paginates using search_from/search_to with a strict maximum search_size of 100.
-    XSIAM error: "0 < search_size <= 100" if exceeded.
-    """
     if page_size <= 0 or page_size > 100:
         raise ValueError("page_size must be in range 1..100 for XSIAM public API")
 
@@ -247,7 +200,7 @@ def paged_get_all(
             "request_data": {
                 "extended_view": extended_view,
                 "search_from": start,
-                "search_to": start + page_size,  # size = page_size, must be <= 100
+                "search_to": start + page_size,
             }
         }
         resp = http_post(session, base_url, endpoint, payload)
@@ -284,7 +237,6 @@ def load_desired_correlations() -> List[dict]:
     desired: List[dict] = []
     for p in sorted(corr_dir.glob("*.json")):
         obj = json.loads(p.read_text(encoding="utf-8"))
-        # Enforce managed scoping for safety
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
         desc = (obj.get("description") or "").strip()
@@ -438,7 +390,6 @@ def main() -> None:
 
     print(f"Desired: correlations={len(desired_correlations)} biocs={len(desired_biocs)} iocs={len(desired_iocs)}")
 
-    # Fetch remote state (read-only calls happen even in DRY_RUN)
     remote_correlations = paged_get_all(s, base_url, "/public_api/v1/correlations/get", extended_view=True, page_size=100)
     remote_biocs = paged_get_all(s, base_url, "/public_api/v1/bioc/get", extended_view=True, page_size=100)
     remote_iocs = paged_get_all(s, base_url, "/public_api/v1/indicators/get", extended_view=True, page_size=100)
@@ -455,6 +406,8 @@ def main() -> None:
         "description",
         "alert_name",
         "alert_category",
+        "alert_description",
+        "alert_fields",
         "execution_mode",
         "search_window",
         "simple_schedule",
@@ -463,6 +416,12 @@ def main() -> None:
         "suppression_enabled",
         "suppression_duration",
         "suppression_fields",
+        "dataset",
+        "user_defined_severity",
+        "user_defined_category",
+        "mitre_defs",
+        "investigation_query_link",
+        "drilldown_query_timeframe",
         "mapping_strategy",
     }
 
