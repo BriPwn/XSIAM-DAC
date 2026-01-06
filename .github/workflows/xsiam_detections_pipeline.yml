@@ -28,7 +28,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -41,11 +41,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install PyYAML==6.0.3 requests==2.32.5
 
-      - name: Checkout Sigma2XSIAM (vendor)
-        uses: actions/checkout@v4
-        with:
-          repository: presi/sigma2xsiam
-          path: vendor/Sigma2XSIAM
+      - name: Clone Sigma2XSIAM (vendor)
+        env:
+          SIGMA2XSIAM_TOKEN: ${{ secrets.SIGMA2XSIAM_TOKEN }}
+        run: |
+          rm -rf vendor/Sigma2XSIAM
+          git clone https://x-access-token:${SIGMA2XSIAM_TOKEN}@github.com/presi/sigma2xsiam.git vendor/Sigma2XSIAM
+          test -f vendor/Sigma2XSIAM/convert_rule.py
+          test -f vendor/Sigma2XSIAM/pipelines/cortex_xdm.yml
 
       - name: Generate XQL + correlation payloads
         run: |
@@ -55,9 +58,7 @@ jobs:
         run: |
           test -d generated/xql
           test -d generated/correlations
-          echo "XQL files:"
           ls -la generated/xql || true
-          echo "Correlation JSON files:"
           ls -la generated/correlations || true
 
   reconcile_apply:
@@ -65,7 +66,7 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -78,11 +79,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install PyYAML==6.0.3 requests==2.32.5
 
-      - name: Checkout Sigma2XSIAM (vendor)
-        uses: actions/checkout@v4
-        with:
-          repository: presi/sigma2xsiam
-          path: vendor/Sigma2XSIAM
+      - name: Clone Sigma2XSIAM (vendor)
+        env:
+          SIGMA2XSIAM_TOKEN: ${{ secrets.SIGMA2XSIAM_TOKEN }}
+        run: |
+          rm -rf vendor/Sigma2XSIAM
+          git clone https://x-access-token:${SIGMA2XSIAM_TOKEN}@github.com/presi/sigma2xsiam.git vendor/Sigma2XSIAM
+          test -f vendor/Sigma2XSIAM/convert_rule.py
+          test -f vendor/Sigma2XSIAM/pipelines/cortex_xdm.yml
 
       - name: Generate XQL + correlation payloads
         run: |
@@ -91,9 +95,7 @@ jobs:
       - name: Show generated files (debug)
         run: |
           echo "PWD=$(pwd)"
-          echo "Tree:"
           find generated -maxdepth 2 -type f -print || true
-          echo "Correlation JSON:"
           ls -la generated/correlations || true
 
       - name: Reconcile into XSIAM
@@ -101,9 +103,9 @@ jobs:
           XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
           XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
           XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
           DAC_PREFIX: "DAC: "
           DAC_MARKER: "Managed by detections-as-code"
-          SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: |
           python -u scripts/reconcile_xsiam.py
