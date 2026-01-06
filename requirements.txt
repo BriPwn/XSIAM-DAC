@@ -1,7 +1,6 @@
 requests==2.32.3
-PyYAML==6.0.2
-
 pysigma==1.0.2
 pyparsing>=3.1,<4.0
+
 
 
