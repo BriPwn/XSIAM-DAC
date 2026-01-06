@@ -119,6 +119,14 @@ def stable_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def dataset_for_query(xql: str) -> str:
+    # Your generated XQL sometimes starts with: "datamodel dataset = * | ..."
+    if "datamodel dataset = *" in xql:
+        return "*"
+    # Fallback to a common default
+    return "xdr_data"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sigma-dir", default="rules/sigma")
@@ -140,6 +148,8 @@ def main() -> None:
 
     sigma_files = sorted(list(sigma_dir.rglob("*.yml")) + list(sigma_dir.rglob("*.yaml")))
     print(f"[GEN] sigma_dir={sigma_dir.resolve()} files={len(sigma_files)}")
+    print(f"[GEN] out_corr_dir={out_corr_dir.resolve()}")
+    print(f"[GEN] vendor_dir={SIGMA2XSIAM_DIR.resolve()}")
 
     if not sigma_files:
         raise SystemExit(f"[GEN] No Sigma files found under: {sigma_dir.resolve()}")
@@ -176,17 +186,15 @@ def main() -> None:
             xql_path.write_text(xql_query + "\n", encoding="utf-8")
             written_xql += 1
 
-            # ✅ Payload aligned to your tenant validation:
-            # - action must be ALERTS
-            # - lookup_mapping must be list
-            # - alert_domain must be a DOMAIN_* enum
-            # - don't set user_defined_* unless using "User Defined"
             corr_payload = {
+                # Your tenant says this is required
+                "rule_id": 0,
+
                 "name": name,
                 "description": desc,
 
                 "xql_query": xql_query,
-                "dataset": "xdr_data",
+                "dataset": dataset_for_query(xql_query),
 
                 "is_enabled": True,
                 "execution_mode": "SCHEDULED",
@@ -195,13 +203,26 @@ def main() -> None:
                 "timezone": "Etc/UTC",
                 "crontab": "*/5 * * * *",
 
+                # Must be ALERTS (not ALERT)
                 "action": "ALERTS",
 
                 "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
+
+                # Required keys in your tenant; must be null unless using "User Defined"
+                "user_defined_severity": None,
+
                 "alert_name": name,
                 "alert_description": desc,
                 "alert_category": "OTHER",
+
+                # Required keys in your tenant; must be null unless "User Defined"
+                "user_defined_category": None,
+
+                # Valid enum set shown by your tenant error
                 "alert_domain": "DOMAIN_SECURITY",
+
+                # Required in your tenant error list
+                "alert_type": "OTHER",
 
                 "alert_fields": {},
                 "mitre_defs": {},
@@ -212,7 +233,7 @@ def main() -> None:
 
                 "mapping_strategy": "AUTO",
 
-                # must be list (not dict)
+                # Must be list (not dict)
                 "lookup_mapping": [],
 
                 "investigation_query_link": xql_query,
@@ -234,3 +255,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
