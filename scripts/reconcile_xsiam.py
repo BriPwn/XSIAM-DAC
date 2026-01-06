@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -51,17 +51,23 @@ def parse_objects_count(resp: dict) -> Optional[int]:
 
 
 def raise_on_api_errors(endpoint: str, resp: dict) -> None:
-    # errors array form
+    # Some endpoints return {errors:[...]} on 200
     errors = resp.get("errors") or []
     if errors:
         raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
 
-    # err_code/err_msg form
+    # Some endpoints return {err_code, err_msg, err_extra} on 200
     if "err_code" in resp and resp.get("err_code"):
-        raise SystemExit(f"XSIAM API error for {endpoint}: {resp.get('err_msg')} :: {resp.get('err_extra')}")
+        raise SystemExit(
+            f"XSIAM API error for {endpoint}: err_code={resp.get('err_code')} "
+            f"err_msg={resp.get('err_msg')} err_extra={resp.get('err_extra')}"
+        )
 
 
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
+    """
+    POST with retries for retryable statuses. For 4xx (except 429) raises SystemExit with body.
+    """
     url = f"{base_url}{path}"
 
     if DRY_RUN and (path.endswith("/insert") or path.endswith("/delete")):
@@ -171,6 +177,40 @@ def get_correlation_by_name(session: requests.Session, base_url: str, name: str)
     return parse_objects(resp)
 
 
+def _try_insert_variants(
+    session: requests.Session, base_url: str, obj: dict
+) -> Tuple[dict, str]:
+    """
+    Some tenants behave differently for CREATE on correlations/insert:
+      - Variant A: omit rule_id
+      - Variant B: include rule_id=0 (matches doc examples) :contentReference[oaicite:2]{index=2}
+
+    We try A then B, but only for CREATE path.
+    Returns (response, variant_used).
+    """
+    # Variant A: no rule_id at all
+    a = dict(obj)
+    a.pop("rule_id", None)
+    try:
+        resp = http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [a]})
+        return resp, "create_without_rule_id"
+    except SystemExit as e:
+        msg = str(e)
+        # If the tenant requires rule_id, or if missing rule_id triggers a schema error, try variant B.
+        # We also try B if A produced a generic create failure.
+        if "Missing the fields" in msg or "rule_id" in msg or "Failed to create correlation rule" in msg:
+            pass
+        else:
+            # A failed for another reason (like XQL parse); don't mask it.
+            raise
+
+    # Variant B: rule_id = 0 (doc example)
+    b = dict(obj)
+    b["rule_id"] = 0
+    resp = http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [b]})
+    return resp, "create_with_rule_id_0"
+
+
 def main() -> None:
     print("=== RECONCILE_XSIAM.PY START ===")
     print(f"[RECON] cwd={Path.cwd()}")
@@ -208,34 +248,30 @@ def main() -> None:
         print(f"[correlation] attempting upsert: {name}")
 
         existing = remote_by_name.get(name)
+
         if existing:
-            # UPDATE: set rule_id to existing id (docs: same id overwrites) :contentReference[oaicite:15]{index=15}
+            # UPDATE: force rule_id to existing id
             d2 = dict(d)
             d2["rule_id"] = existing.get("id")
-            payload = {"request_data": [d2]}
-            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", payload)
+            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d2]})
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
-            print(f"[correlation] insert response: added={add_n} updated={upd_n}")
+            print(f"[correlation] update response: added={add_n} updated={upd_n}")
             if upd_n > 0:
                 updated += 1
             else:
                 unchanged += 1
         else:
-            # CREATE: rule_id must be 0 (per request examples) :contentReference[oaicite:16]{index=16}
-            d_create = dict(d)
-            d_create["rule_id"] = 0
-            payload = {"request_data": [d_create]}
-            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", payload)
+            # CREATE: try variants to handle tenant behavior differences
+            resp, variant = _try_insert_variants(s, base_url, d)
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
-            print(f"[correlation] insert response: added={add_n} updated={upd_n}")
+            print(f"[correlation] create response({variant}): added={add_n} updated={upd_n}")
             if add_n > 0:
                 created += 1
             else:
-                raise SystemExit(
-                    f"[correlation] ERROR: expected add, got added={add_n} updated={upd_n}. Full response: {resp}"
-                )
+                # If the API responded 200 but didn't add, treat as failure (no silent no-op)
+                raise SystemExit(f"[correlation] ERROR: create returned added={add_n} updated={upd_n}. Full response: {resp}")
 
         # Verify after upsert
         objs = get_correlation_by_name(s, base_url, name)
