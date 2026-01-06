@@ -16,6 +16,8 @@ Behavior:
 Reliability:
 - Normalizes XSIAM_FQDN so it can be either a bare host or a full https:// URL
 - Retries on transient network errors and 429/5xx/599
+- **Fix applied:** XSIAM paging constraint enforced: 1 <= search_size <= 100
+- **Fix applied:** Non-retryable 599 handling when body indicates a deterministic client error
 - FAILS if API returns errors/failures in JSON even when HTTP=200
 
 Env vars:
@@ -133,6 +135,16 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
     if failures:
         raise SystemExit(f"XSIAM API returned failures for {endpoint}: {failures}")
 
+    # Some Cortex APIs use reply.err_code/err_msg for failures
+    rep = resp.get("reply")
+    if isinstance(rep, dict):
+        err_code = rep.get("err_code")
+        if isinstance(err_code, int) and err_code != 0:
+            # This is a generic "error wrapper" many endpoints use
+            err_msg = rep.get("err_msg")
+            err_extra = rep.get("err_extra")
+            raise SystemExit(f"XSIAM API error for {endpoint}: err_code={err_code} err_msg={err_msg} err_extra={err_extra}")
+
     if resp.get("success") is False:
         raise SystemExit(f"XSIAM API indicates success=false for {endpoint}: {resp}")
 
@@ -140,6 +152,23 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
 # ----------------------------
 # HTTP with retries
 # ----------------------------
+def _is_non_retryable_599(body_json: dict) -> bool:
+    """
+    XSIAM sometimes returns deterministic validation errors with HTTP 599.
+    If so, retries will never fix it.
+    """
+    rep = body_json.get("reply") if isinstance(body_json, dict) else None
+    if not isinstance(rep, dict):
+        return False
+    extra = rep.get("err_extra") or ""
+    msg = rep.get("err_msg") or ""
+    combined = f"{msg} {extra}".lower()
+    # Add patterns here as you discover them
+    if "search size" in combined or "search_size" in combined:
+        return True
+    return False
+
+
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
     url = f"{base_url}{path}"
 
@@ -151,6 +180,16 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
     for attempt in range(1, 6):
         try:
             r = session.post(url, json=payload, timeout=(10, 180))  # (connect, read)
+
+            # Handle "weird" 599 that actually contains a deterministic error body
+            if r.status_code == 599:
+                try:
+                    j = r.json()
+                    if _is_non_retryable_599(j):
+                        raise SystemExit(f"Non-retryable XSIAM 599 error from {url}: {j}")
+                except ValueError:
+                    # Not JSON; treat as retryable below
+                    pass
 
             # Retry-worthy HTTP statuses (including 599 emitted by some proxies/LBs)
             if r.status_code in (429, 500, 502, 503, 504, 599):
@@ -171,6 +210,10 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
             raise_on_api_errors(path, data)
             return data
 
+        except SystemExit:
+            # Non-retryable deterministic validation error
+            raise
+
         except (ConnectionError, Timeout, HTTPError) as e:
             last_exc = e
             if attempt < 5:
@@ -188,8 +231,15 @@ def paged_get_all(
     base_url: str,
     endpoint: str,
     extended_view: bool = True,
-    page_size: int = 200,
+    page_size: int = 100,  # <-- IMPORTANT: XSIAM requires 1..100 (search_size constraint)
 ) -> List[dict]:
+    """
+    Paginates using search_from/search_to with a strict maximum search_size of 100.
+    XSIAM error: "0 < search_size <= 100" if exceeded.
+    """
+    if page_size <= 0 or page_size > 100:
+        raise ValueError("page_size must be in range 1..100 for XSIAM public API")
+
     out: List[dict] = []
     start = 0
     while True:
@@ -197,7 +247,7 @@ def paged_get_all(
             "request_data": {
                 "extended_view": extended_view,
                 "search_from": start,
-                "search_to": start + page_size,
+                "search_to": start + page_size,  # size = page_size, must be <= 100
             }
         }
         resp = http_post(session, base_url, endpoint, payload)
@@ -389,9 +439,9 @@ def main() -> None:
     print(f"Desired: correlations={len(desired_correlations)} biocs={len(desired_biocs)} iocs={len(desired_iocs)}")
 
     # Fetch remote state (read-only calls happen even in DRY_RUN)
-    remote_correlations = paged_get_all(s, base_url, "/public_api/v1/correlations/get", extended_view=True)
-    remote_biocs = paged_get_all(s, base_url, "/public_api/v1/bioc/get", extended_view=True)
-    remote_iocs = paged_get_all(s, base_url, "/public_api/v1/indicators/get", extended_view=True)
+    remote_correlations = paged_get_all(s, base_url, "/public_api/v1/correlations/get", extended_view=True, page_size=100)
+    remote_biocs = paged_get_all(s, base_url, "/public_api/v1/bioc/get", extended_view=True, page_size=100)
+    remote_iocs = paged_get_all(s, base_url, "/public_api/v1/indicators/get", extended_view=True, page_size=100)
 
     # ------------------------
     # Correlations
@@ -546,3 +596,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
