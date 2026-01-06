@@ -1,138 +1,109 @@
-name: XSIAM Detections-as-Code (Full Reconcile)
+name: XSIAM Detections-as-Code
 
 on:
   pull_request:
-    branches: ["main"]
+    paths:
+      - "rules/**"
+      - "scripts/**"
+      - ".github/workflows/xsiam_detections_pipeline.yml"
   push:
     branches: ["main"]
+    paths:
+      - "rules/**"
+      - "scripts/**"
+      - ".github/workflows/xsiam_detections_pipeline.yml"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run (no changes in XSIAM)"
-        required: false
+        description: "If true, do not apply changes to XSIAM (plan only)."
+        required: true
         default: "true"
-      dac_prefix:
-        description: "Managed rule name prefix"
-        required: false
-        default: "DAC: "
-      dac_marker:
-        description: "Managed rule marker text"
-        required: false
-        default: "Managed by detections-as-code"
 
 permissions:
   contents: read
 
-env:
-  DAC_PREFIX: "DAC: "
-  DAC_MARKER: "Managed by detections-as-code"
-  DRY_RUN: "false"
-  SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
-
 jobs:
   validate:
-    name: Validate + Generate Artifacts
+    name: Validate / Generate (no apply)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install PyYAML==6.0.3 requests==2.32.5
 
-      - name: Checkout Sigma2XSIAM converter
-        run: |
-          git clone --depth 1 --branch v1.2 https://github.com/deepzec/Sigma2XSIAM.git vendor/Sigma2XSIAM
+      - name: Checkout Sigma2XSIAM (vendor)
+        uses: actions/checkout@v4
+        with:
+          repository: presi/sigma2xsiam
+          path: vendor/Sigma2XSIAM
 
-      - name: Convert Sigma -> XQL + correlation payloads
+      - name: Generate XQL + correlation payloads
         run: |
-          python scripts/sigma_to_xql.py
+          python -u scripts/sigma_to_xql.py
 
-      - name: Local duplicate validation (optional)
+      - name: Validate generated outputs exist
         run: |
-          if [ -f scripts/validate_no_duplicates.py ]; then
-            python scripts/validate_no_duplicates.py
-          else
-            echo "No local duplicate validation script found; skipping."
-          fi
+          test -d generated/xql
+          test -d generated/correlations
+          echo "XQL files:"
+          ls -la generated/xql || true
+          echo "Correlation JSON files:"
+          ls -la generated/correlations || true
 
   reconcile_apply:
-    name: Reconcile XSIAM (Apply on main push)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [validate]
+    name: Reconcile (apply to XSIAM)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    env:
-      XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
-      XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
-      XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-      DRY_RUN: "false"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install PyYAML==6.0.3 requests==2.32.5
 
-      - name: Checkout Sigma2XSIAM converter
-        run: |
-          git clone --depth 1 --branch v1.2 https://github.com/deepzec/Sigma2XSIAM.git vendor/Sigma2XSIAM
-
-      - name: Convert Sigma -> XQL + correlation payloads
-        run: |
-          python scripts/sigma_to_xql.py
-
-      - name: Reconcile XSIAM (upsert + delete managed drift)
-        run: |
-          python scripts/reconcile_xsiam.py
-
-  reconcile_manual:
-    name: Reconcile XSIAM (Manual)
-    if: github.event_name == 'workflow_dispatch'
-    needs: [validate]
-    runs-on: ubuntu-latest
-    env:
-      XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
-      XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
-      XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-      DRY_RUN: ${{ inputs.dry_run }}
-      DAC_PREFIX: ${{ inputs.dac_prefix }}
-      DAC_MARKER: ${{ inputs.dac_marker }}
-    steps:
-      - name: Checkout
+      - name: Checkout Sigma2XSIAM (vendor)
         uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          repository: presi/sigma2xsiam
+          path: vendor/Sigma2XSIAM
 
-      - name: Install dependencies
+      - name: Generate XQL + correlation payloads
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
+          python -u scripts/sigma_to_xql.py
 
-      - name: Checkout Sigma2XSIAM converter
+      - name: Show generated files (debug)
         run: |
-          git clone --depth 1 --branch v1.2 https://github.com/deepzec/Sigma2XSIAM.git vendor/Sigma2XSIAM
+          echo "PWD=$(pwd)"
+          echo "Tree:"
+          find generated -maxdepth 2 -type f -print || true
+          echo "Correlation JSON:"
+          ls -la generated/correlations || true
 
-      - name: Convert Sigma -> XQL + correlation payloads
+      - name: Reconcile into XSIAM
+        env:
+          XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
+          XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
+          XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          DAC_PREFIX: "DAC: "
+          DAC_MARKER: "Managed by detections-as-code"
+          SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
         run: |
-          python scripts/sigma_to_xql.py
-
-      - name: Reconcile XSIAM (manual)
-        run: |
-          python scripts/reconcile_xsiam.py
+          python -u scripts/reconcile_xsiam.py
