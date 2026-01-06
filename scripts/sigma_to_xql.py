@@ -13,16 +13,19 @@ from typing import Any, Dict, List
 
 import yaml
 
+# Keep within allowed correlation severities; clamp critical to high
 SEVERITY_MAP = {
     "informational": "SEV_010_INFO",
+    "info": "SEV_010_INFO",
     "low": "SEV_020_LOW",
     "medium": "SEV_030_MEDIUM",
     "high": "SEV_040_HIGH",
-    "critical": "SEV_050_CRITICAL",
+    "critical": "SEV_040_HIGH",
 }
 
 DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ")
 DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
+
 SIGMA2XSIAM_DIR = Path(os.getenv("SIGMA2XSIAM_DIR", "vendor/Sigma2XSIAM"))
 CONVERTER = SIGMA2XSIAM_DIR / "convert_rule.py"
 PIPELINE_PATH = SIGMA2XSIAM_DIR / "pipelines" / "cortex_xdm.yml"
@@ -35,7 +38,6 @@ def sigma_level_to_xsiam(level: str | None) -> str:
 
 
 def sanitize_filename(name: str) -> str:
-    # safe for linux/windows
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
@@ -90,14 +92,7 @@ def apply_managed_scoping(name: str, description: str) -> tuple[str, str]:
 
 
 def convert_one_sigma_to_xql(single_rule_path: Path) -> str:
-    """
-    Runs vendor/Sigma2XSIAM/convert_rule.py and returns the XQL output.
-    We DO NOT rely on the converter writing an output file we later read.
-    We capture stdout/stderr and validate.
-    """
-    # Use temp output file as some converters require -o, but we will read it ourselves.
     tmp_out = single_rule_path.with_suffix(".xql.out")
-
     cmd = ["python", "convert_rule.py", "-r", str(single_rule_path.resolve()), "-o", str(tmp_out.resolve())]
     proc = subprocess.run(cmd, cwd=str(SIGMA2XSIAM_DIR), capture_output=True, text=True)
 
@@ -109,7 +104,6 @@ def convert_one_sigma_to_xql(single_rule_path: Path) -> str:
         )
 
     if not tmp_out.exists():
-        # fallback: sometimes converter prints output to stdout
         stdout = (proc.stdout or "").strip()
         if stdout:
             return stdout
@@ -145,11 +139,7 @@ def main() -> None:
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     sigma_files = sorted(list(sigma_dir.rglob("*.yml")) + list(sigma_dir.rglob("*.yaml")))
-    print(f"[GEN] cwd={Path.cwd()}")
     print(f"[GEN] sigma_dir={sigma_dir.resolve()} files={len(sigma_files)}")
-    print(f"[GEN] out_xql_dir={out_xql_dir.resolve()}")
-    print(f"[GEN] out_corr_dir={out_corr_dir.resolve()}")
-    print(f"[GEN] vendor_dir={SIGMA2XSIAM_DIR.resolve()}")
 
     if not sigma_files:
         raise SystemExit(f"[GEN] No Sigma files found under: {sigma_dir.resolve()}")
@@ -169,87 +159,77 @@ def main() -> None:
 
             fallback = f"{rule_path.stem}-{doc_idx}" if len(docs) > 1 else rule_path.stem
             base_name = derive_rule_name(rule_dict, fallback)
-            desc_raw = str(rule_dict.get("description") or "")
 
+            desc_raw = str(rule_dict.get("description") or "")
             name, desc = apply_managed_scoping(base_name, desc_raw)
 
-            # ensure uniqueness across docs/files even if titles collide
             uniq = stable_hash(f"{rule_path.as_posix()}::{doc_idx}::{name}")
             safe_name = sanitize_filename(name)
             safe = f"{safe_name}__{uniq}"
 
-            # Write single-doc Sigma into tmp (converter can't handle multi-doc input)
             tmp_rule = tmp_dir / f"{safe}.yml"
             tmp_rule.write_text(yaml.safe_dump(rule_dict, sort_keys=False), encoding="utf-8")
 
-            # Convert to XQL
             xql_query = convert_one_sigma_to_xql(tmp_rule)
 
-            # Write XQL
             xql_path = out_xql_dir / f"{safe}.xql"
             xql_path.write_text(xql_query + "\n", encoding="utf-8")
             written_xql += 1
 
-            # Build FULL required correlation payload (per your tenant error message)
+            # ✅ Payload aligned to your tenant validation:
+            # - action must be ALERTS
+            # - lookup_mapping must be list
+            # - alert_domain must be a DOMAIN_* enum
+            # - don't set user_defined_* unless using "User Defined"
             corr_payload = {
                 "name": name,
                 "description": desc,
 
-                "is_enabled": True,
-                "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
-                "user_defined_severity": "MEDIUM",
-
-                "execution_mode": "SCHEDULED",
-                "search_window": "\"2 hours\"",
-                "simple_schedule": "\"5 minutes\"",
-                "timezone": "UTC",
-                "crontab": "",
-
                 "xql_query": xql_query,
-                "dataset": "",
-                "lookup_mapping": {},
-                "mapping_strategy": "AUTO",
+                "dataset": "xdr_data",
 
-                "suppression_enabled": True,
-                "suppression_duration": "\"1 hours\"",
-                "suppression_fields": ["\"event_type\""],
+                "is_enabled": True,
+                "execution_mode": "SCHEDULED",
+                "search_window": "2 hours",
+                "simple_schedule": "5 minutes",
+                "timezone": "Etc/UTC",
+                "crontab": "*/5 * * * *",
 
-                "action": "ALERT",
+                "action": "ALERTS",
 
+                "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
                 "alert_name": name,
                 "alert_description": desc,
                 "alert_category": "OTHER",
-                "user_defined_category": "OTHER",
-                "alert_domain": "OTHER",
-                "alert_type": "OTHER",
+                "alert_domain": "DOMAIN_SECURITY",
 
-                "alert_fields": [],
-                "mitre_defs": [],
+                "alert_fields": {},
+                "mitre_defs": {},
 
-                "investigation_query_link": "",
-                "drilldown_query_timeframe": "\"24 hours\"",
+                "suppression_enabled": True,
+                "suppression_duration": "1 hours",
+                "suppression_fields": ["event_type"],
+
+                "mapping_strategy": "AUTO",
+
+                # must be list (not dict)
+                "lookup_mapping": [],
+
+                "investigation_query_link": xql_query,
+                "drilldown_query_timeframe": "QUERY",
             }
 
             corr_path = out_corr_dir / f"{safe}.json"
             corr_path.write_text(json.dumps(corr_payload, indent=2) + "\n", encoding="utf-8")
             written_corr += 1
 
-            print(f"[GEN] OK {rule_path} doc={doc_idx}/{len(docs)} ->")
-            print(f"      XQL : {xql_path}")
-            print(f"      CORR: {corr_path}")
-            print(f"      NAME: {name}")
+            print(f"[GEN] OK {rule_path} doc={doc_idx}/{len(docs)} -> {corr_path.name}")
 
-    # HARD FAIL if nothing generated
-    corr_files = sorted(out_corr_dir.glob("*.json"))
-    xql_files = sorted(out_xql_dir.glob("*.xql"))
+    corr_files = sorted([p for p in out_corr_dir.glob("*.json") if p.name != ".gitkeep"])
     print(f"[GEN] wrote_xql={written_xql} wrote_corr={written_corr}")
-    print(f"[GEN] disk_xql_files={len(xql_files)} disk_corr_files={len(corr_files)}")
-
+    print(f"[GEN] disk_corr_files={len(corr_files)}")
     if len(corr_files) == 0:
-        raise SystemExit(
-            "[GEN] ERROR: No correlation JSON files were produced in generated/correlations.\n"
-            "This means conversion/generation did not create any payloads. Check Sigma rules and converter output."
-        )
+        raise SystemExit("[GEN] ERROR: No correlation JSON files produced.")
 
 
 if __name__ == "__main__":
