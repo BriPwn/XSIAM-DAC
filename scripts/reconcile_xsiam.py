@@ -1,47 +1,74 @@
 #!/usr/bin/env python3
 # scripts/reconcile_xsiam.py
 """
-Full reconciliation for XSIAM (Git = source of truth)
+Full reconciliation for Cortex XSIAM (Git = source of truth)
 
 Manages:
 - Correlation rules (by name) from generated/correlations/*.json
 - BIOCs (by name) from rules/biocs/biocs.yaml
 - IOCs (by (type, indicator)) from rules/iocs/iocs.yaml
 
-Reconciliation behavior:
+Behavior:
 - Create if missing
-- Update if changed (idempotent compare on "managed keys")
+- Update if changed (idempotent compare on managed keys)
 - Delete if remote object is managed-by-this-pipeline AND missing from desired state
 
-CRITICAL reliability improvement:
-- XSIAM APIs can return HTTP 200 while still providing errors in the response body.
-  This script FAILS the run if response contains errors / failures (so "green" really means "applied").
+Reliability:
+- Normalizes XSIAM_FQDN so it can be either a bare host or a full https:// URL
+- Retries on transient network errors and 429/5xx/599
+- FAILS if API returns errors/failures in JSON even when HTTP=200
 
 Env vars:
-- XSIAM_FQDN, XSIAM_API_KEY, XSIAM_API_KEY_ID (required)
+Required:
+- XSIAM_FQDN  (either api-tenant.xdr... OR https://api-tenant.xdr...)
+- XSIAM_API_KEY
+- XSIAM_API_KEY_ID
+
+Optional:
 - DAC_PREFIX (default "DAC: ")
 - DAC_MARKER (default "Managed by detections-as-code")
-- DRY_RUN (default false) - prints actions, does not perform inserts/deletes
+- DRY_RUN    (default "false")
 """
+
+from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 import yaml
+from requests.exceptions import ConnectionError, HTTPError, Timeout
 
 DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ")
 DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
 
 
+# ----------------------------
+# Utilities
+# ----------------------------
 def must_env(name: str) -> str:
     v = os.environ.get(name, "").strip()
     if not v:
         raise SystemExit(f"Missing env var: {name}")
     return v
+
+
+def normalize_base_url(fqdn_or_url: str) -> str:
+    """
+    Accepts either:
+      - api-tenant.xdr.us.paloaltonetworks.com
+      - https://api-tenant.xdr.us.paloaltonetworks.com
+    Returns a clean base URL with no trailing slash.
+    """
+    v = fqdn_or_url.strip()
+    if v.startswith("http://") or v.startswith("https://"):
+        return v.rstrip("/")
+    return ("https://" + v).rstrip("/")
 
 
 def load_yaml(path: Path):
@@ -53,6 +80,7 @@ def normalize_value(v: Any) -> Any:
     if isinstance(v, str):
         return v.strip()
     if isinstance(v, list):
+        # sort simple lists for deterministic compare
         if all(not isinstance(x, dict) for x in v):
             return sorted(normalize_value(x) for x in v)
         return [normalize_value(x) for x in v]
@@ -71,7 +99,7 @@ def is_managed_by_pipeline(name: str, text_field: str) -> bool:
 
 
 def parse_objects(resp: dict) -> List[dict]:
-    # common patterns
+    # common patterns in Cortex APIs
     if isinstance(resp.get("objects"), list):
         return resp["objects"]
     rep = resp.get("reply")
@@ -94,37 +122,74 @@ def parse_objects_count(resp: dict) -> Optional[int]:
 
 def raise_on_api_errors(endpoint: str, resp: dict) -> None:
     """
-    Fail the run if API indicates errors, even if HTTP 200.
-    This is what prevents "pipeline succeeded but nothing changed".
+    Fail the run if API indicates errors/failures, even if HTTP 200.
+    This prevents "pipeline succeeded but nothing changed".
     """
-    # most common patterns
     errors = resp.get("errors") or []
     if errors:
         raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
 
-    # sometimes failures list
     failures = resp.get("failed_objects") or resp.get("failed") or []
     if failures:
         raise SystemExit(f"XSIAM API returned failures for {endpoint}: {failures}")
 
-    # sometimes success flag
     if resp.get("success") is False:
         raise SystemExit(f"XSIAM API indicates success=false for {endpoint}: {resp}")
 
 
+# ----------------------------
+# HTTP with retries
+# ----------------------------
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
+    url = f"{base_url}{path}"
+
+    # Dry run should still read remote state; only skip mutations
     if DRY_RUN and (path.endswith("/insert") or path.endswith("/delete")):
-        # Return a fake success structure for DRY_RUN.
         return {"dry_run": True, "path": path, "payload": payload, "errors": []}
 
-    r = session.post(f"{base_url}{path}", json=payload, timeout=180)
-    r.raise_for_status()
-    data = r.json()
-    raise_on_api_errors(path, data)
-    return data
+    last_exc: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            r = session.post(url, json=payload, timeout=(10, 180))  # (connect, read)
+
+            # Retry-worthy HTTP statuses (including 599 emitted by some proxies/LBs)
+            if r.status_code in (429, 500, 502, 503, 504, 599):
+                body = (r.text or "")[:800]
+                raise HTTPError(
+                    f"HTTP {r.status_code} from {url}. Body (first 800 chars): {body}",
+                    response=r,
+                )
+
+            r.raise_for_status()
+
+            # Some APIs may return non-json on error; raise to surface it
+            try:
+                data = r.json()
+            except Exception:
+                raise SystemExit(f"Non-JSON response from {url} (status {r.status_code}): {(r.text or '')[:800]}")
+
+            raise_on_api_errors(path, data)
+            return data
+
+        except (ConnectionError, Timeout, HTTPError) as e:
+            last_exc = e
+            if attempt < 5:
+                sleep_s = 2 ** (attempt - 1)
+                print(f"Request failed (attempt {attempt}/5): {e}\nRetrying in {sleep_s}s...")
+                time.sleep(sleep_s)
+                continue
+            break
+
+    raise SystemExit(f"XSIAM request failed after retries: {url}\nLast error: {last_exc}")
 
 
-def paged_get_all(session: requests.Session, base_url: str, endpoint: str, extended_view: bool = True, page_size: int = 200) -> List[dict]:
+def paged_get_all(
+    session: requests.Session,
+    base_url: str,
+    endpoint: str,
+    extended_view: bool = True,
+    page_size: int = 200,
+) -> List[dict]:
     out: List[dict] = []
     start = 0
     while True:
@@ -140,13 +205,13 @@ def paged_get_all(session: requests.Session, base_url: str, endpoint: str, exten
         out.extend(objs)
 
         count = parse_objects_count(resp)
-        if count is not None:
-            if len(out) >= count:
-                break
+        if count is not None and len(out) >= count:
+            break
         if not objs:
             break
 
         start += page_size
+
     return out
 
 
@@ -160,14 +225,16 @@ def index_by_name(objs: List[dict]) -> Dict[str, List[dict]]:
 
 
 # ------------------------
-# Desired State Loaders
+# Desired state loaders
 # ------------------------
 def load_desired_correlations() -> List[dict]:
     corr_dir = Path("generated/correlations")
-    desired = []
+    if not corr_dir.exists():
+        return []
+    desired: List[dict] = []
     for p in sorted(corr_dir.glob("*.json")):
         obj = json.loads(p.read_text(encoding="utf-8"))
-        # enforce managed scoping just in case generator didn't
+        # Enforce managed scoping for safety
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
         desc = (obj.get("description") or "").strip()
@@ -183,7 +250,7 @@ def load_desired_biocs() -> List[dict]:
         return []
     data = load_yaml(p) or {}
     items = data.get("rules", []) if isinstance(data, dict) else []
-    desired = []
+    desired: List[dict] = []
     for obj in items:
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
@@ -200,7 +267,7 @@ def load_desired_iocs() -> List[dict]:
         return []
     data = load_yaml(p) or {}
     items = data.get("indicators", []) if isinstance(data, dict) else []
-    desired = []
+    desired: List[dict] = []
     for obj in items:
         comment = (obj.get("comment") or "").strip()
         if DAC_MARKER not in comment:
@@ -230,7 +297,6 @@ def upsert_by_name(
     if not existing_list:
         payload = {"request_data": [desired]}
         resp = http_post(session, base_url, insert_endpoint, payload)
-        # helpful telemetry
         added = resp.get("added_objects") or []
         updated = resp.get("updated_objects") or []
         print(f"[{obj_type}] insert response: added={len(added)} updated={len(updated)}")
@@ -293,12 +359,18 @@ def delete_ioc(session: requests.Session, base_url: str, indicator_value: str) -
     http_post(session, base_url, "/public_api/v1/indicators/delete", payload)
 
 
+# ------------------------
+# Main
+# ------------------------
 def main() -> None:
     fqdn = must_env("XSIAM_FQDN")
     api_key = must_env("XSIAM_API_KEY")
     api_key_id = must_env("XSIAM_API_KEY_ID")
 
-    base_url = f"https://{fqdn}"
+    base_url = normalize_base_url(fqdn)
+    print(f"Using XSIAM base URL: {base_url}")
+    if urlparse(base_url).scheme != "https":
+        raise SystemExit("XSIAM base URL must be https.")
 
     s = requests.Session()
     s.headers.update(
@@ -314,7 +386,9 @@ def main() -> None:
     desired_biocs = load_desired_biocs()
     desired_iocs = load_desired_iocs()
 
-    # Fetch remote state
+    print(f"Desired: correlations={len(desired_correlations)} biocs={len(desired_biocs)} iocs={len(desired_iocs)}")
+
+    # Fetch remote state (read-only calls happen even in DRY_RUN)
     remote_correlations = paged_get_all(s, base_url, "/public_api/v1/correlations/get", extended_view=True)
     remote_biocs = paged_get_all(s, base_url, "/public_api/v1/bioc/get", extended_view=True)
     remote_iocs = paged_get_all(s, base_url, "/public_api/v1/indicators/get", extended_view=True)
@@ -323,7 +397,6 @@ def main() -> None:
     # Correlations
     # ------------------------
     corr_idx = index_by_name(remote_correlations)
-
     corr_keys = {
         "name",
         "severity",
