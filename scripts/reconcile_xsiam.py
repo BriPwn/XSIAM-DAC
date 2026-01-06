@@ -51,18 +51,14 @@ def parse_objects_count(resp: dict) -> Optional[int]:
 
 
 def raise_on_api_errors(endpoint: str, resp: dict) -> None:
+    # errors array form
     errors = resp.get("errors") or []
     if errors:
         raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
 
-    rep = resp.get("reply")
-    if isinstance(rep, dict):
-        err_code = rep.get("err_code")
-        if isinstance(err_code, int) and err_code != 0:
-            raise SystemExit(
-                f"XSIAM API error for {endpoint}: err_code={err_code} "
-                f"err_msg={rep.get('err_msg')} err_extra={rep.get('err_extra')}"
-            )
+    # err_code/err_msg form
+    if "err_code" in resp and resp.get("err_code"):
+        raise SystemExit(f"XSIAM API error for {endpoint}: {resp.get('err_msg')} :: {resp.get('err_extra')}")
 
 
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
@@ -139,7 +135,7 @@ def index_by_name(objs: List[dict]) -> Dict[str, dict]:
 
 def load_desired_correlations() -> List[dict]:
     corr_dir = Path("generated/correlations")
-    files = sorted(corr_dir.glob("*.json")) if corr_dir.exists() else []
+    files = sorted([p for p in corr_dir.glob("*.json") if p.name != ".gitkeep"]) if corr_dir.exists() else []
     print(f"[RECON] corr_dir={corr_dir.resolve()} exists={corr_dir.exists()} files={len(files)}")
     print(f"[RECON] corr_files={ [p.name for p in files[:50]] }")
 
@@ -150,7 +146,7 @@ def load_desired_correlations() -> List[dict]:
     for p in files:
         obj = json.loads(p.read_text(encoding="utf-8"))
 
-        # Enforce managed scoping
+        # enforce managed scoping
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
         desc = (obj.get("description") or "").strip()
@@ -173,17 +169,6 @@ def get_correlation_by_name(session: requests.Session, base_url: str, name: str)
     }
     resp = http_post(session, base_url, "/public_api/v1/correlations/get", payload)
     return parse_objects(resp)
-
-
-def strip_rule_id_if_zero(d: dict) -> dict:
-    """
-    Tenant behavior: rule_id=0 is treated as UPDATE and fails.
-    For CREATE, omit rule_id entirely.
-    """
-    out = dict(d)
-    if "rule_id" in out and (out["rule_id"] in (0, "0", None, "")):
-        out.pop("rule_id", None)
-    return out
 
 
 def main() -> None:
@@ -223,9 +208,8 @@ def main() -> None:
         print(f"[correlation] attempting upsert: {name}")
 
         existing = remote_by_name.get(name)
-
         if existing:
-            # UPDATE: rule_id must be the existing object id
+            # UPDATE: set rule_id to existing id (docs: same id overwrites) :contentReference[oaicite:15]{index=15}
             d2 = dict(d)
             d2["rule_id"] = existing.get("id")
             payload = {"request_data": [d2]}
@@ -238,8 +222,9 @@ def main() -> None:
             else:
                 unchanged += 1
         else:
-            # CREATE: omit rule_id entirely (rule_id=0 fails in your tenant)
-            d_create = strip_rule_id_if_zero(d)
+            # CREATE: rule_id must be 0 (per request examples) :contentReference[oaicite:16]{index=16}
+            d_create = dict(d)
+            d_create["rule_id"] = 0
             payload = {"request_data": [d_create]}
             resp = http_post(s, base_url, "/public_api/v1/correlations/insert", payload)
             add_n = len(resp.get("added_objects") or [])
@@ -249,7 +234,7 @@ def main() -> None:
                 created += 1
             else:
                 raise SystemExit(
-                    f"[correlation] ERROR: expected create, got added={add_n} updated={upd_n}. Full response: {resp}"
+                    f"[correlation] ERROR: expected add, got added={add_n} updated={upd_n}. Full response: {resp}"
                 )
 
         # Verify after upsert
