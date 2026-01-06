@@ -1,8 +1,6 @@
 name: XSIAM Detections-as-Code
 
 on:
-  pull_request:
-    branches: ["main"]
   push:
     branches: ["main"]
   workflow_dispatch:
@@ -10,85 +8,64 @@ on:
       dry_run:
         description: "Plan only (do not apply to XSIAM)"
         required: true
-        default: "true"
+        default: "false"
 
 permissions:
   contents: read
 
 jobs:
   dac:
-    name: Generate + Reconcile XSIAM
     runs-on: ubuntu-latest
-
     steps:
-      # ------------------------------------------------------------
-      # Checkout THIS repo
-      # ------------------------------------------------------------
       - name: Checkout detections repo
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Python
-      # ------------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ------------------------------------------------------------
-      # Dependencies (minimal – sigma conversion is subprocess-based)
-      # ------------------------------------------------------------
-      - name: Install Python dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install "PyYAML==6.0.3" "requests==2.32.5" "pysigma==1.0.2"
 
-      # ------------------------------------------------------------
-      # Clone Sigma2XSIAM (PUBLIC repo)
-      # ------------------------------------------------------------
-      - name: Clone Sigma2XSIAM
+      - name: Clone Sigma2XSIAM (public)
         run: |
           rm -rf vendor/Sigma2XSIAM
           git clone https://github.com/gocortexio/sigma2xsiam.git vendor/Sigma2XSIAM
-          echo "Sigma2XSIAM contents:"
-          ls -la vendor/Sigma2XSIAM
           test -f vendor/Sigma2XSIAM/convert_rule.py
           test -f vendor/Sigma2XSIAM/pipelines/cortex_xdm.yml
 
-      # ------------------------------------------------------------
-      # Generate XQL + correlation payloads
-      # ------------------------------------------------------------
-      - name: Generate XQL and correlation payloads
+      - name: Generate XQL + correlation payloads
         env:
           SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
           DAC_PREFIX: "DAC: "
           DAC_MARKER: "Managed by detections-as-code"
         run: |
+          set -euxo pipefail
           python -u scripts/sigma_to_xql.py
-
-      # ------------------------------------------------------------
-      # HARD DEBUG: prove files exist
-      # ------------------------------------------------------------
-      - name: Debug generated outputs
-        run: |
-          echo "PWD=$(pwd)"
-          echo "Generated tree:"
-          find generated -maxdepth 3 -type f -print || true
-          echo "Correlation JSON files:"
+          echo "=== POST-GENERATE CHECK ==="
+          pwd
+          ls -la
+          ls -la generated || true
           ls -la generated/correlations || true
+          test -d generated/correlations
+          test "$(ls -1 generated/correlations/*.json | wc -l)" -ge 1
 
-      # ------------------------------------------------------------
-      # Reconcile into XSIAM (apply or plan)
-      # ------------------------------------------------------------
-      - name: Reconcile into XSIAM
+      - name: Reconcile into XSIAM (UPLOAD)
         env:
           XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
           XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
           XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-          SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           DAC_PREFIX: "DAC: "
           DAC_MARKER: "Managed by detections-as-code"
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: |
+          set -euxo pipefail
+          echo "=== ABOUT TO RUN RECONCILE ==="
+          pwd
+          ls -la generated/correlations || true
           python -u scripts/reconcile_xsiam.py
+
 
