@@ -68,7 +68,6 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
     url = f"{base_url}{path}"
 
-    # Skip only mutations in dry-run mode
     if DRY_RUN and (path.endswith("/insert") or path.endswith("/delete")):
         print(f"[HTTP] DRY_RUN skip POST {url}")
         return {"dry_run": True, "path": path, "payload": payload, "errors": []}
@@ -108,7 +107,6 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
 
 
 def paged_get_all(session: requests.Session, base_url: str, endpoint: str, page_size: int = 100) -> List[dict]:
-    # XSIAM requires 1..100
     if page_size <= 0 or page_size > 100:
         raise ValueError("page_size must be 1..100")
 
@@ -151,12 +149,14 @@ def load_desired_correlations() -> List[dict]:
     desired: List[dict] = []
     for p in files:
         obj = json.loads(p.read_text(encoding="utf-8"))
-        # enforce managed scoping
+
+        # Enforce managed scoping
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
         desc = (obj.get("description") or "").strip()
         if DAC_MARKER not in desc:
             obj["description"] = (desc + "\n\n" + DAC_MARKER).strip()
+
         desired.append(obj)
 
     return desired
@@ -175,8 +175,19 @@ def get_correlation_by_name(session: requests.Session, base_url: str, name: str)
     return parse_objects(resp)
 
 
+def strip_rule_id_if_zero(d: dict) -> dict:
+    """
+    Tenant behavior: rule_id=0 is treated as UPDATE and fails.
+    For CREATE, omit rule_id entirely.
+    """
+    out = dict(d)
+    if "rule_id" in out and (out["rule_id"] in (0, "0", None, "")):
+        out.pop("rule_id", None)
+    return out
+
+
 def main() -> None:
-    print("=== RECONCILE_XSIAM.PY START ===")  # <-- unmistakable banner
+    print("=== RECONCILE_XSIAM.PY START ===")
     print(f"[RECON] cwd={Path.cwd()}")
     print(f"[RECON] DRY_RUN={DRY_RUN}")
 
@@ -212,9 +223,11 @@ def main() -> None:
         print(f"[correlation] attempting upsert: {name}")
 
         existing = remote_by_name.get(name)
+
         if existing:
+            # UPDATE: rule_id must be the existing object id
             d2 = dict(d)
-            d2["rule_id"] = existing.get("id")  # upsert/update requires rule_id
+            d2["rule_id"] = existing.get("id")
             payload = {"request_data": [d2]}
             resp = http_post(s, base_url, "/public_api/v1/correlations/insert", payload)
             add_n = len(resp.get("added_objects") or [])
@@ -225,7 +238,9 @@ def main() -> None:
             else:
                 unchanged += 1
         else:
-            payload = {"request_data": [d]}  # rule_id should be 0 for create
+            # CREATE: omit rule_id entirely (rule_id=0 fails in your tenant)
+            d_create = strip_rule_id_if_zero(d)
+            payload = {"request_data": [d_create]}
             resp = http_post(s, base_url, "/public_api/v1/correlations/insert", payload)
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
@@ -233,7 +248,9 @@ def main() -> None:
             if add_n > 0:
                 created += 1
             else:
-                raise SystemExit(f"[correlation] ERROR: expected add, got added={add_n} updated={upd_n}. Full response: {resp}")
+                raise SystemExit(
+                    f"[correlation] ERROR: expected create, got added={add_n} updated={upd_n}. Full response: {resp}"
+                )
 
         # Verify after upsert
         objs = get_correlation_by_name(s, base_url, name)
