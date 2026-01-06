@@ -2,20 +2,20 @@ name: XSIAM Detections-as-Code (Full Reconcile)
 
 on:
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Dry run (no changes in XSIAM)"
         required: false
-        default: "false"
-      prefix:
+        default: "true"
+      dac_prefix:
         description: "Managed rule name prefix"
         required: false
         default: "DAC: "
-      marker:
+      dac_marker:
         description: "Managed rule marker text"
         required: false
         default: "Managed by detections-as-code"
@@ -23,9 +23,15 @@ on:
 permissions:
   contents: read
 
+# Defaults (used for PRs and normal pushes)
+env:
+  DAC_PREFIX: "DAC: "
+  DAC_MARKER: "Managed by detections-as-code"
+  DRY_RUN: "false"
+
 jobs:
   validate:
-    name: Validate + Build Generated Artifacts
+    name: Validate + Generate Artifacts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -42,15 +48,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Convert Sigma -> XQL + correlation payloads
-        env:
-          DAC_PREFIX: ${{ github.event.inputs.prefix || 'DAC: ' }}
-          DAC_MARKER: ${{ github.event.inputs.marker || 'Managed by detections-as-code' }}
         run: |
           python scripts/sigma_to_xql.py
 
       - name: Local duplicate validation (optional)
-        # If you have scripts/validate_no_duplicates.py, enable this.
-        # If not, remove this step.
         run: |
           if [ -f scripts/validate_no_duplicates.py ]; then
             python scripts/validate_no_duplicates.py
@@ -58,22 +59,18 @@ jobs:
             echo "No local duplicate validation script found; skipping."
           fi
 
-  reconcile:
-    name: Reconcile XSIAM (Upsert + Delete managed drift)
+  reconcile_main:
+    name: Reconcile XSIAM (Apply on main push)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [ validate ]
+    needs: [validate]
     runs-on: ubuntu-latest
-
     env:
+      # Required secrets for API calls
       XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
       XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
       XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
 
-      # Managed scope controls
-      DAC_PREFIX: "DAC: "
-      DAC_MARKER: "Managed by detections-as-code"
-
-      # Safety: default false (set true via workflow_dispatch only if you want)
+      # Apply mode (NOT dry run) on main pushes
       DRY_RUN: "false"
 
     steps:
@@ -98,21 +95,21 @@ jobs:
         run: |
           python scripts/reconcile_xsiam.py
 
-  reconcile_dry_run:
-    name: Reconcile XSIAM (Dry Run)
-    # Run only when manually triggered
+  reconcile_manual:
+    name: Reconcile XSIAM (Manual workflow_dispatch)
     if: github.event_name == 'workflow_dispatch'
-    needs: [ validate ]
+    needs: [validate]
     runs-on: ubuntu-latest
-
     env:
+      # Required secrets for API calls
       XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
       XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
       XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
 
-      DAC_PREFIX: ${{ github.event.inputs.prefix }}
-      DAC_MARKER: ${{ github.event.inputs.marker }}
-      DRY_RUN: ${{ github.event.inputs.dry_run }}
+      # Allow manual overrides
+      DRY_RUN: ${{ inputs.dry_run }}
+      DAC_PREFIX: ${{ inputs.dac_prefix }}
+      DAC_MARKER: ${{ inputs.dac_marker }}
 
     steps:
       - name: Checkout
@@ -132,6 +129,7 @@ jobs:
         run: |
           python scripts/sigma_to_xql.py
 
-      - name: Reconcile XSIAM (Dry Run)
+      - name: Reconcile XSIAM (manual)
         run: |
           python scripts/reconcile_xsiam.py
+
