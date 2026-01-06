@@ -1,5 +1,5 @@
-title: Kerberoast ticket request detected
-name: kerberoast_ticket_request
+title: Kerberoast ticket request detected RC4
+name: kerberoast_ticket_request_detected_rc4
 description: Detects scenarios where an attacker requests a Kerberoast ticket with low encryption to perform offline brutforce and forge a new ticket to get access to the targeted resource.
 references:
   - https://github.com/mdecrevoisier/EVTX-to-MITRE-Attack/tree/master/TA0006-Credential%20Access/T1558-Steal%20or%20Forge%20Kerberos%20Tickets
