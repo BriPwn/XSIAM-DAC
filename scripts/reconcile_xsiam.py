@@ -1,558 +1,261 @@
 #!/usr/bin/env python3
-# scripts/reconcile_xsiam.py
+# scripts/sigma_to_xql.py
+"""
+Sigma -> XQL + XSIAM Correlation payload generator (robust, CI-safe)
+
+What this does:
+- Reads Sigma YAML from rules/sigma/**/*.yml|yaml
+- Supports MULTI-DOC YAML files separated by '---'
+- Writes each doc to a temp single-rule YAML, converts via Sigma2XSIAM's convert_rule.py
+- Outputs:
+  - generated/xql/<safe_name>.xql
+  - generated/correlations/<safe_name>.json  (payload for /public_api/v1/correlations/insert)
+
+Why this approach:
+- Avoids Python packaging collisions around sigma.backends.* by invoking convert_rule.py via subprocess.
+- Ensures converter finds its pipeline file by running with cwd=SIGMA2XSIAM_DIR.
+
+Safety/ownership:
+- Adds DAC_PREFIX to names
+- Adds DAC_MARKER to description (for safe reconciliation deletes)
+
+Env vars:
+- DAC_PREFIX (default: "DAC: ")
+- DAC_MARKER (default: "Managed by detections-as-code")
+- SIGMA2XSIAM_DIR (default: "vendor/Sigma2XSIAM")
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
-import time
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, List
 
-import requests
 import yaml
-from requests.exceptions import ConnectionError, HTTPError, Timeout
+
+SEVERITY_MAP = {
+    "informational": "SEV_010_INFO",
+    "low": "SEV_020_LOW",
+    "medium": "SEV_030_MEDIUM",
+    "high": "SEV_040_HIGH",
+    "critical": "SEV_050_CRITICAL",
+}
 
 DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ")
 DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
+
+SIGMA2XSIAM_DIR = Path(os.getenv("SIGMA2XSIAM_DIR", "vendor/Sigma2XSIAM"))
+CONVERTER = SIGMA2XSIAM_DIR / "convert_rule.py"
+PIPELINE_REL = Path("pipelines") / "cortex_xdm.yml"  # converter expects this relative to its CWD
 
 
-# ----------------------------
-# Utilities
-# ----------------------------
-def must_env(name: str) -> str:
-    v = os.environ.get(name, "").strip()
-    if not v:
-        raise SystemExit(f"Missing env var: {name}")
-    return v
+def sigma_level_to_xsiam(level: str | None) -> str:
+    if not level:
+        return "SEV_030_MEDIUM"
+    return SEVERITY_MAP.get(level.strip().lower(), "SEV_030_MEDIUM")
 
 
-def normalize_base_url(fqdn_or_url: str) -> str:
-    v = fqdn_or_url.strip()
-    if v.startswith("http://") or v.startswith("https://"):
-        return v.rstrip("/")
-    return ("https://" + v).rstrip("/")
+def sanitize_filename(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
-def load_yaml(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def ensure_vendor_present() -> None:
+    if not SIGMA2XSIAM_DIR.exists():
+        raise SystemExit(f"Sigma2XSIAM directory not found: {SIGMA2XSIAM_DIR}")
+    if not CONVERTER.exists():
+        raise SystemExit(f"Missing Sigma2XSIAM converter at: {CONVERTER}")
+    pipeline_path = SIGMA2XSIAM_DIR / PIPELINE_REL
+    if not pipeline_path.exists():
+        raise SystemExit(
+            f"Pipeline file not found: {pipeline_path}. "
+            f"The converter expects {PIPELINE_REL} relative to its working directory."
+        )
 
 
-def normalize_value(v: Any) -> Any:
-    if isinstance(v, str):
-        return v.strip()
-    if isinstance(v, list):
-        if all(not isinstance(x, dict) for x in v):
-            return sorted(normalize_value(x) for x in v)
-        return [normalize_value(x) for x in v]
-    if isinstance(v, dict):
-        return {k: normalize_value(v[k]) for k in sorted(v.keys())}
-    return v
+def validate_sigma_minimum(rule_dict: Dict[str, Any], src: Path, doc_idx: int) -> None:
+    """
+    Sigma2XSIAM requires logsource to map the rule.
+    Fail fast with a helpful error.
+    """
+    logsource = rule_dict.get("logsource")
+    if not isinstance(logsource, dict) or not logsource:
+        raise SystemExit(
+            "Sigma rule must have a logsource.\n"
+            f"File: {src} (doc {doc_idx})\n\n"
+            "Add something like:\n"
+            "logsource:\n"
+            "  product: windows\n"
+            "  service: security\n"
+        )
 
 
-def normalize_for_compare(obj: Dict[str, Any], allowed_keys: set[str]) -> Dict[str, Any]:
-    filtered = {k: obj.get(k) for k in allowed_keys if k in obj}
-    return normalize_value(filtered)
+def convert_one_sigma(single_rule_path: Path, out_path: Path) -> str:
+    """
+    Invoke Sigma2XSIAM converter for a single Sigma rule YAML file.
+
+    We run with cwd=SIGMA2XSIAM_DIR so the converter finds pipelines/cortex_xdm.yml.
+    We pass absolute paths to rule/output so it can read/write outside the cwd.
+    """
+    rule_abs = single_rule_path.resolve()
+    out_abs = out_path.resolve()
+
+    cmd = ["python", "convert_rule.py", "-r", str(rule_abs), "-o", str(out_abs)]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(SIGMA2XSIAM_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"Conversion failed for {single_rule_path}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}\n"
+        )
+
+    if not out_abs.exists():
+        raise SystemExit(f"Converter did not produce output file: {out_abs}")
+
+    return out_abs.read_text(encoding="utf-8").strip()
 
 
-def is_managed_by_pipeline(name: str, text_field: str) -> bool:
-    return name.startswith(DAC_PREFIX) and (DAC_MARKER in (text_field or ""))
-
-
-def parse_objects(resp: dict) -> List[dict]:
-    if isinstance(resp.get("objects"), list):
-        return resp["objects"]
-    rep = resp.get("reply")
-    if isinstance(rep, dict):
-        if isinstance(rep.get("objects"), list):
-            return rep["objects"]
-        if isinstance(rep.get("data"), list):
-            return rep["data"]
-    return []
-
-
-def parse_objects_count(resp: dict) -> Optional[int]:
-    if isinstance(resp.get("objects_count"), int):
-        return resp["objects_count"]
-    rep = resp.get("reply")
-    if isinstance(rep, dict) and isinstance(rep.get("objects_count"), int):
-        return rep["objects_count"]
-    return None
-
-
-def raise_on_api_errors(endpoint: str, resp: dict) -> None:
-    errors = resp.get("errors") or []
-    if errors:
-        raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
-
-    failures = resp.get("failed_objects") or resp.get("failed") or []
-    if failures:
-        raise SystemExit(f"XSIAM API returned failures for {endpoint}: {failures}")
-
-    rep = resp.get("reply")
-    if isinstance(rep, dict):
-        err_code = rep.get("err_code")
-        if isinstance(err_code, int) and err_code != 0:
-            err_msg = rep.get("err_msg")
-            err_extra = rep.get("err_extra")
-            raise SystemExit(
-                f"XSIAM API error for {endpoint}: err_code={err_code} err_msg={err_msg} err_extra={err_extra}"
-            )
-
-    if resp.get("success") is False:
-        raise SystemExit(f"XSIAM API indicates success=false for {endpoint}: {resp}")
-
-
-# ----------------------------
-# HTTP with retries
-# ----------------------------
-def _is_non_retryable_599(body_json: dict) -> bool:
-    rep = body_json.get("reply") if isinstance(body_json, dict) else None
-    if not isinstance(rep, dict):
-        return False
-    extra = rep.get("err_extra") or ""
-    msg = rep.get("err_msg") or ""
-    combined = f"{msg} {extra}".lower()
-    if "search size" in combined or "search_size" in combined:
-        return True
-    return False
-
-
-def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
-    url = f"{base_url}{path}"
-
-    if DRY_RUN and (path.endswith("/insert") or path.endswith("/delete")):
-        return {"dry_run": True, "path": path, "payload": payload, "errors": []}
-
-    last_exc: Exception | None = None
-    for attempt in range(1, 6):
-        try:
-            r = session.post(url, json=payload, timeout=(10, 180))  # connect/read
-
-            # 599 can be either transient LB/proxy OR a deterministic JSON validation error
-            if r.status_code == 599:
-                try:
-                    j = r.json()
-                    if _is_non_retryable_599(j):
-                        raise SystemExit(f"Non-retryable XSIAM 599 error from {url}: {j}")
-                except ValueError:
-                    pass
-
-            # If XSIAM returns a 4xx (except 429), don't retry—surface body immediately
-            if 400 <= r.status_code < 500 and r.status_code != 429:
-                body = (r.text or "")[:2000]
-                raise SystemExit(
-                    f"Non-retryable HTTP {r.status_code} from {url}\n"
-                    f"Response body (first 2000 chars):\n{body}"
-                )
-
-            # Retry-worthy HTTP statuses
-            if r.status_code in (429, 500, 502, 503, 504, 599):
-                body = (r.text or "")[:800]
-                raise HTTPError(
-                    f"HTTP {r.status_code} from {url}. Body (first 800 chars): {body}",
-                    response=r,
-                )
-
-            r.raise_for_status()
-
-            try:
-                data = r.json()
-            except Exception:
-                raise SystemExit(
-                    f"Non-JSON response from {url} (status {r.status_code}): {(r.text or '')[:2000]}"
-                )
-
-            raise_on_api_errors(path, data)
-            return data
-
-        except SystemExit:
-            raise
-        except (ConnectionError, Timeout, HTTPError) as e:
-            last_exc = e
-            if attempt < 5:
-                sleep_s = 2 ** (attempt - 1)
-                print(f"Request failed (attempt {attempt}/5): {e}\nRetrying in {sleep_s}s...")
-                time.sleep(sleep_s)
-                continue
-            break
-
-    raise SystemExit(f"XSIAM request failed after retries: {url}\nLast error: {last_exc}")
-
-
-def paged_get_all(
-    session: requests.Session,
-    base_url: str,
-    endpoint: str,
-    extended_view: bool = True,
-    page_size: int = 100,
-) -> List[dict]:
-    if page_size <= 0 or page_size > 100:
-        raise ValueError("page_size must be in range 1..100 for XSIAM public API")
-
-    out: List[dict] = []
-    start = 0
-    while True:
-        payload = {
-            "request_data": {
-                "extended_view": extended_view,
-                "search_from": start,
-                "search_to": start + page_size,
-            }
-        }
-        resp = http_post(session, base_url, endpoint, payload)
-        objs = parse_objects(resp)
-        out.extend(objs)
-
-        count = parse_objects_count(resp)
-        if count is not None and len(out) >= count:
-            break
-        if not objs:
-            break
-
-        start += page_size
-
+def load_yaml_documents(raw: str, src: Path) -> List[Dict[str, Any]]:
+    docs = list(yaml.safe_load_all(raw))
+    out: List[Dict[str, Any]] = []
+    for i, d in enumerate(docs, start=1):
+        if d is None:
+            continue
+        if not isinstance(d, dict):
+            print(f"Skipping non-dict YAML document in {src} (doc #{i})")
+            continue
+        out.append(d)
     return out
 
 
-def index_by_name(objs: List[dict]) -> Dict[str, List[dict]]:
-    m: Dict[str, List[dict]] = {}
-    for o in objs:
-        n = (o.get("name") or "").strip()
-        if n:
-            m.setdefault(n, []).append(o)
-    return m
+def derive_rule_name(rule_dict: Dict[str, Any], fallback: str) -> str:
+    raw_name = rule_dict.get("title") or rule_dict.get("id") or fallback
+    raw_name = str(raw_name).strip()
+    return raw_name if raw_name else fallback
 
 
-# ------------------------
-# Desired state loaders
-# ------------------------
-def load_desired_correlations() -> List[dict]:
-    corr_dir = Path("generated/correlations")
-    if not corr_dir.exists():
-        return []
-    desired: List[dict] = []
-    for p in sorted(corr_dir.glob("*.json")):
-        obj = json.loads(p.read_text(encoding="utf-8"))
-        if not obj["name"].startswith(DAC_PREFIX):
-            obj["name"] = f"{DAC_PREFIX}{obj['name']}"
-        desc = (obj.get("description") or "").strip()
-        if DAC_MARKER not in desc:
-            obj["description"] = (desc + "\n\n" + DAC_MARKER).strip()
-        desired.append(obj)
-    return desired
+def apply_managed_scoping(name: str, description: str) -> tuple[str, str]:
+    if not name.startswith(DAC_PREFIX):
+        name = f"{DAC_PREFIX}{name}"
+
+    description = (description or "").strip()
+    if DAC_MARKER not in description:
+        description = (description + "\n\n" + DAC_MARKER).strip()
+
+    return name, description
 
 
-def load_desired_biocs() -> List[dict]:
-    p = Path("rules/biocs/biocs.yaml")
-    if not p.exists():
-        return []
-    data = load_yaml(p) or {}
-    items = data.get("rules", []) if isinstance(data, dict) else []
-    desired: List[dict] = []
-    for obj in items:
-        if not obj["name"].startswith(DAC_PREFIX):
-            obj["name"] = f"{DAC_PREFIX}{obj['name']}"
-        comment = (obj.get("comment") or "").strip()
-        if DAC_MARKER not in comment:
-            obj["comment"] = (comment + "\n\n" + DAC_MARKER).strip()
-        desired.append(obj)
-    return desired
-
-
-def load_desired_iocs() -> List[dict]:
-    p = Path("rules/iocs/iocs.yaml")
-    if not p.exists():
-        return []
-    data = load_yaml(p) or {}
-    items = data.get("indicators", []) if isinstance(data, dict) else []
-    desired: List[dict] = []
-    for obj in items:
-        comment = (obj.get("comment") or "").strip()
-        if DAC_MARKER not in comment:
-            obj["comment"] = (comment + "\n\n" + DAC_MARKER).strip()
-        desired.append(obj)
-    return desired
-
-
-# ------------------------
-# Upsert/Delete helpers
-# ------------------------
-def upsert_by_name(
-    session: requests.Session,
-    base_url: str,
-    obj_type: str,
-    desired: dict,
-    remote_index: Dict[str, List[dict]],
-    insert_endpoint: str,
-    managed_keys: set[str],
-) -> str:
-    name = desired["name"].strip()
-    existing_list = remote_index.get(name, [])
-
-    if len(existing_list) > 1:
-        raise SystemExit(f"Remote has duplicate {obj_type} objects named '{name}'. Cannot reconcile safely.")
-
-    if not existing_list:
-        payload = {"request_data": [desired]}
-        resp = http_post(session, base_url, insert_endpoint, payload)
-        added = resp.get("added_objects") or []
-        updated = resp.get("updated_objects") or []
-        print(f"[{obj_type}] insert response: added={len(added)} updated={len(updated)}")
-        return "created"
-
-    existing = existing_list[0]
-    desired_for_update = dict(desired)
-    desired_for_update["rule_id"] = existing.get("id")
-
-    if normalize_for_compare(desired_for_update, managed_keys) == normalize_for_compare(existing, managed_keys):
-        return "unchanged"
-
-    payload = {"request_data": [desired_for_update]}
-    resp = http_post(session, base_url, insert_endpoint, payload)
-    added = resp.get("added_objects") or []
-    updated = resp.get("updated_objects") or []
-    print(f"[{obj_type}] update response: added={len(added)} updated={len(updated)}")
-    return "updated"
-
-
-def delete_by_name(session: requests.Session, base_url: str, delete_endpoint: str, name: str) -> None:
-    payload = {"request_data": {"filters": [{"field": "name", "operator": "EQ", "value": name}]}}
-    http_post(session, base_url, delete_endpoint, payload)
-
-
-def upsert_ioc(
-    session: requests.Session,
-    base_url: str,
-    desired: dict,
-    remote_map: Dict[Tuple[str, str], dict],
-    managed_keys: set[str],
-) -> str:
-    key = (str(desired.get("type")), str(desired.get("indicator")))
-    existing = remote_map.get(key)
-
-    if existing is None:
-        payload = {"request_data": [desired]}
-        resp = http_post(session, base_url, "/public_api/v1/indicators/insert", payload)
-        added = resp.get("added_objects") or []
-        updated = resp.get("updated_objects") or []
-        print(f"[ioc] insert response: added={len(added)} updated={len(updated)}")
-        return "created"
-
-    desired_for_update = dict(desired)
-    desired_for_update["rule_id"] = existing.get("id")
-
-    if normalize_for_compare(desired_for_update, managed_keys) == normalize_for_compare(existing, managed_keys):
-        return "unchanged"
-
-    payload = {"request_data": [desired_for_update]}
-    resp = http_post(session, base_url, "/public_api/v1/indicators/insert", payload)
-    added = resp.get("added_objects") or []
-    updated = resp.get("updated_objects") or []
-    print(f"[ioc] update response: added={len(added)} updated={len(updated)}")
-    return "updated"
-
-
-def delete_ioc(session: requests.Session, base_url: str, indicator_value: str) -> None:
-    payload = {"request_data": {"filters": [{"field": "indicator", "operator": "EQ", "value": indicator_value}]}}
-    http_post(session, base_url, "/public_api/v1/indicators/delete", payload)
-
-
-# ------------------------
-# Main
-# ------------------------
 def main() -> None:
-    fqdn = must_env("XSIAM_FQDN")
-    api_key = must_env("XSIAM_API_KEY")
-    api_key_id = must_env("XSIAM_API_KEY_ID")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sigma-dir", default="rules/sigma")
+    ap.add_argument("--out-xql-dir", default="generated/xql")
+    ap.add_argument("--out-corr-dir", default="generated/correlations")
+    ap.add_argument("--tmp-dir", default=".tmp_sigma2xsiam")
+    args = ap.parse_args()
 
-    base_url = normalize_base_url(fqdn)
-    print(f"Using XSIAM base URL: {base_url}")
-    if urlparse(base_url).scheme != "https":
-        raise SystemExit("XSIAM base URL must be https.")
+    ensure_vendor_present()
 
-    s = requests.Session()
-    s.headers.update(
-        {
-            "Authorization": api_key,
-            "x-xdr-auth-id": api_key_id,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-    )
+    sigma_dir = Path(args.sigma_dir)
+    out_xql_dir = Path(args.out_xql_dir)
+    out_corr_dir = Path(args.out_corr_dir)
+    tmp_dir = Path(args.tmp_dir)
 
-    desired_correlations = load_desired_correlations()
-    desired_biocs = load_desired_biocs()
-    desired_iocs = load_desired_iocs()
+    out_xql_dir.mkdir(parents=True, exist_ok=True)
+    out_corr_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Desired: correlations={len(desired_correlations)} biocs={len(desired_biocs)} iocs={len(desired_iocs)}")
+    sigma_files = sorted(list(sigma_dir.rglob("*.yml")) + list(sigma_dir.rglob("*.yaml")))
+    if not sigma_files:
+        print(f"No Sigma files found in {sigma_dir}")
+        return
 
-    remote_correlations = paged_get_all(s, base_url, "/public_api/v1/correlations/get", extended_view=True, page_size=100)
-    remote_biocs = paged_get_all(s, base_url, "/public_api/v1/bioc/get", extended_view=True, page_size=100)
-    remote_iocs = paged_get_all(s, base_url, "/public_api/v1/indicators/get", extended_view=True, page_size=100)
+    for rule_path in sigma_files:
+        raw = rule_path.read_text(encoding="utf-8")
+        docs = load_yaml_documents(raw, rule_path)
 
-    # ------------------------
-    # Correlations
-    # ------------------------
-    corr_idx = index_by_name(remote_correlations)
-    corr_keys = {
-        "name",
-        "severity",
-        "xql_query",
-        "is_enabled",
-        "description",
-        "alert_name",
-        "alert_category",
-        "alert_description",
-        "alert_fields",
-        "execution_mode",
-        "search_window",
-        "simple_schedule",
-        "timezone",
-        "crontab",
-        "suppression_enabled",
-        "suppression_duration",
-        "suppression_fields",
-        "dataset",
-        "user_defined_severity",
-        "user_defined_category",
-        "mitre_defs",
-        "investigation_query_link",
-        "drilldown_query_timeframe",
-        "mapping_strategy",
-    }
-
-    c_created = c_updated = c_unchanged = c_deleted = 0
-    desired_corr_names = set()
-
-    for d in desired_correlations:
-        desired_corr_names.add(d["name"])
-        status = upsert_by_name(
-            s,
-            base_url,
-            "correlation",
-            d,
-            corr_idx,
-            "/public_api/v1/correlations/insert",
-            corr_keys,
-        )
-        print(f"[correlation] {d['name']}: {status}")
-        if status == "created":
-            c_created += 1
-        elif status == "updated":
-            c_updated += 1
-        else:
-            c_unchanged += 1
-
-    for r in remote_correlations:
-        name = (r.get("name") or "").strip()
-        desc = (r.get("description") or "").strip()
-        if not name:
+        if not docs:
+            print(f"Skipping empty/invalid Sigma YAML: {rule_path}")
             continue
-        if is_managed_by_pipeline(name, desc) and name not in desired_corr_names:
-            print(f"[correlation] {name}: delete")
-            if not DRY_RUN:
-                delete_by_name(s, base_url, "/public_api/v1/correlations/delete", name)
-            c_deleted += 1
 
-    print(f"Correlation reconcile: {c_created} created, {c_updated} updated, {c_unchanged} unchanged, {c_deleted} deleted")
+        for idx, rule_dict in enumerate(docs, start=1):
+            validate_sigma_minimum(rule_dict, rule_path, idx)
 
-    # ------------------------
-    # BIOCs
-    # ------------------------
-    bioc_idx = index_by_name(remote_biocs)
-    bioc_keys = {"name", "type", "severity", "comment", "status", "is_xql", "indicator"}
+            fallback = f"{rule_path.stem}-{idx}" if len(docs) > 1 else rule_path.stem
+            base_name = derive_rule_name(rule_dict, fallback)
 
-    b_created = b_updated = b_unchanged = b_deleted = 0
-    desired_bioc_names = set()
+            desc = str(rule_dict.get("description") or "")
+            name, desc = apply_managed_scoping(base_name, desc)
 
-    for d in desired_biocs:
-        desired_bioc_names.add(d["name"])
-        status = upsert_by_name(
-            s,
-            base_url,
-            "bioc",
-            d,
-            bioc_idx,
-            "/public_api/v1/bioc/insert",
-            bioc_keys,
-        )
-        print(f"[bioc] {d['name']}: {status}")
-        if status == "created":
-            b_created += 1
-        elif status == "updated":
-            b_updated += 1
-        else:
-            b_unchanged += 1
+            safe = sanitize_filename(name)
+            if len(docs) > 1:
+                safe = f"{safe}__doc{idx}"
 
-    for r in remote_biocs:
-        name = (r.get("name") or "").strip()
-        comment = (r.get("comment") or "").strip()
-        if not name:
-            continue
-        if is_managed_by_pipeline(name, comment) and name not in desired_bioc_names:
-            print(f"[bioc] {name}: delete")
-            if not DRY_RUN:
-                delete_by_name(s, base_url, "/public_api/v1/bioc/delete", name)
-            b_deleted += 1
+            # Write a single-doc Sigma YAML so the converter doesn't choke on multi-doc input
+            tmp_rule = tmp_dir / f"{safe}.yml"
+            tmp_rule.write_text(yaml.safe_dump(rule_dict, sort_keys=False), encoding="utf-8")
 
-    print(f"BIOC reconcile: {b_created} created, {b_updated} updated, {b_unchanged} unchanged, {b_deleted} deleted")
+            tmp_out = tmp_dir / f"{safe}.xql"
+            xql_query = convert_one_sigma(tmp_rule, tmp_out)
 
-    # ------------------------
-    # IOCs
-    # ------------------------
-    remote_ioc_map: Dict[Tuple[str, str], dict] = {}
-    for r in remote_iocs:
-        t = str(r.get("type"))
-        ind = str(r.get("indicator"))
-        if t and ind:
-            remote_ioc_map[(t, ind)] = r
+            (out_xql_dir / f"{safe}.xql").write_text(xql_query + "\n", encoding="utf-8")
 
-    ioc_keys = {
-        "type",
-        "indicator",
-        "severity",
-        "expiration_date",
-        "default_expiration_enabled",
-        "comment",
-        "reputation",
-        "reliability",
-        "vendor_name",
-    }
+            # Correlation payload for /public_api/v1/correlations/insert
+            # These fields align with the API-required set your tenant returned.
+            corr_payload = {
+                # required identifier for upsert. 0 means "create" in insert endpoint.
+                "rule_id": 0,
+                # identity
+                "name": name,
+                "description": desc,
+                # execution
+                "execution_mode": "SCHEDULED",
+                "search_window": "\"2 hours\"",
+                "simple_schedule": "\"5 minutes\"",
+                "timezone": "UTC",
+                "crontab": "",
+                # query / mapping
+                "xql_query": xql_query,
+                "dataset": "",
+                "lookup_mapping": {},
+                "mapping_strategy": "AUTO",
+                # enablement & suppression
+                "is_enabled": True,
+                "suppression_enabled": True,
+                "suppression_duration": "\"1 hours\"",
+                "suppression_fields": ["\"event_type\""],
+                # alert properties
+                "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
+                "user_defined_severity": "MEDIUM",
+                "alert_name": name,
+                "alert_description": desc,
+                "alert_category": "OTHER",
+                "user_defined_category": "OTHER",
+                "alert_domain": "OTHER",
+                "alert_type": "OTHER",
+                # required collections (can be empty)
+                "alert_fields": [],
+                "mitre_defs": [],
+                # required but can be empty/default
+                "investigation_query_link": "",
+                "drilldown_query_timeframe": "\"24 hours\"",
+                # required action field
+                "action": "ALERT",
+            }
 
-    i_created = i_updated = i_unchanged = i_deleted = 0
-    desired_ioc_keys = set()
+            (out_corr_dir / f"{safe}.json").write_text(
+                json.dumps(corr_payload, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
-    for d in desired_iocs:
-        key = (str(d.get("type")), str(d.get("indicator")))
-        desired_ioc_keys.add(key)
-        status = upsert_ioc(s, base_url, d, remote_ioc_map, ioc_keys)
-        print(f"[ioc] {key}: {status}")
-        if status == "created":
-            i_created += 1
-        elif status == "updated":
-            i_updated += 1
-        else:
-            i_unchanged += 1
-
-    for key, r in remote_ioc_map.items():
-        comment = (r.get("comment") or "").strip()
-        if (DAC_MARKER in comment) and key not in desired_ioc_keys:
-            indicator_value = str(r.get("indicator"))
-            print(f"[ioc] {key}: delete")
-            if not DRY_RUN:
-                delete_ioc(s, base_url, indicator_value)
-            i_deleted += 1
-
-    print(f"IOC reconcile: {i_created} created, {i_updated} updated, {i_unchanged} unchanged, {i_deleted} deleted")
-
-    if DRY_RUN:
-        print("DRY_RUN enabled: no changes were applied.")
+            print(f"Converted: {rule_path} (doc {idx}/{len(docs)}) -> {safe}.xql + {safe}.json")
 
 
 if __name__ == "__main__":
     main()
-
