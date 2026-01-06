@@ -41,7 +41,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PyYAML==6.0.3 requests==2.32.5
+          pip install "PyYAML==6.0.3" "requests==2.32.5" "pysigma==1.0.2"
 
       # ------------------------------------------------------------
       # Clone Sigma2XSIAM (PUBLIC repo)
