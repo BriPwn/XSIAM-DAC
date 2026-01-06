@@ -23,11 +23,11 @@ on:
 permissions:
   contents: read
 
-# Defaults (used for PRs and normal pushes)
 env:
   DAC_PREFIX: "DAC: "
   DAC_MARKER: "Managed by detections-as-code"
   DRY_RUN: "false"
+  SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
 
 jobs:
   validate:
@@ -44,8 +44,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
+
+      - name: Checkout Sigma2XSIAM converter
+        run: |
+          git clone --depth 1 --branch v1.2 https://github.com/deepzec/Sigma2XSIAM.git vendor/Sigma2XSIAM
 
       - name: Convert Sigma -> XQL + correlation payloads
         run: |
@@ -59,20 +63,16 @@ jobs:
             echo "No local duplicate validation script found; skipping."
           fi
 
-  reconcile_main:
+  reconcile_apply:
     name: Reconcile XSIAM (Apply on main push)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [validate]
     runs-on: ubuntu-latest
     env:
-      # Required secrets for API calls
       XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
       XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
       XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-
-      # Apply mode (NOT dry run) on main pushes
       DRY_RUN: "false"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -84,33 +84,33 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
+
+      - name: Checkout Sigma2XSIAM converter
+        run: |
+          git clone --depth 1 --branch v1.2 https://github.com/deepzec/Sigma2XSIAM.git vendor/Sigma2XSIAM
 
       - name: Convert Sigma -> XQL + correlation payloads
         run: |
           python scripts/sigma_to_xql.py
 
-      - name: Reconcile XSIAM
+      - name: Reconcile XSIAM (upsert + delete managed drift)
         run: |
           python scripts/reconcile_xsiam.py
 
   reconcile_manual:
-    name: Reconcile XSIAM (Manual workflow_dispatch)
+    name: Reconcile XSIAM (Manual)
     if: github.event_name == 'workflow_dispatch'
     needs: [validate]
     runs-on: ubuntu-latest
     env:
-      # Required secrets for API calls
       XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
       XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
       XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-
-      # Allow manual overrides
       DRY_RUN: ${{ inputs.dry_run }}
       DAC_PREFIX: ${{ inputs.dac_prefix }}
       DAC_MARKER: ${{ inputs.dac_marker }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -122,8 +122,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
+
+      - name: Checkout Sigma2XSIAM converter
+        run: |
+          git clone --depth 1 --branch v1.2 https://github.com/deepzec/Sigma2XSIAM.git vendor/Sigma2XSIAM
 
       - name: Convert Sigma -> XQL + correlation payloads
         run: |
@@ -132,4 +136,3 @@ jobs:
       - name: Reconcile XSIAM (manual)
         run: |
           python scripts/reconcile_xsiam.py
-

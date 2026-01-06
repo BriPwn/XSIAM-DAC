@@ -1,14 +1,8 @@
-# HTTP
 requests>=2.32.5,<3.0.0
-
-# YAML
 PyYAML>=6.0.3,<7.0.0
-
-# Sigma core (fixed List import bug)
 pysigma==1.0.2
-
-# Parsing (compatible with pysigma)
 pyparsing>=3.1,<4.0
+
 
 
 
