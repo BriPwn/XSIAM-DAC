@@ -1,5 +1,7 @@
 requests==2.32.3
 PyYAML==6.0.2
 pysigma==0.11.16
-pysigma-backend-cortexxdr==0.4.2
+
+# XSIAM-focused backend
 git+https://github.com/gocortexio/sigma2xsiam.git
+
