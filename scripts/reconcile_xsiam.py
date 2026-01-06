@@ -65,7 +65,7 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
     url = f"{base_url}{path}"
 
-    if DRY_RUN and (path.endswith("/insert") or path.endswith("/delete")):
+    if DRY_RUN and path.endswith("/insert"):
         print(f"[HTTP] DRY_RUN skip POST {url}")
         return {"dry_run": True, "path": path, "payload": payload, "errors": []}
 
@@ -74,12 +74,10 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
         try:
             r = session.post(url, json=payload, timeout=(10, 180))
 
-            # Non-retryable 4xx (except 429)
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 body = (r.text or "")[:4000]
                 raise SystemExit(f"Non-retryable HTTP {r.status_code} from {url}\nBody:\n{body}")
 
-            # Retry-worthy statuses
             if r.status_code in (429, 500, 502, 503, 504, 599):
                 body = (r.text or "")[:1200]
                 raise HTTPError(f"HTTP {r.status_code} from {url}. Body: {body}", response=r)
@@ -147,6 +145,7 @@ def load_desired_correlations() -> List[dict]:
     for p in files:
         obj = json.loads(p.read_text(encoding="utf-8"))
 
+        # enforce managed scoping
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
 
@@ -211,7 +210,7 @@ def main() -> None:
         existing = remote_by_name.get(name)
 
         if existing:
-            # UPDATE: set rule_id to existing id
+            # UPDATE: overwrite rule_id with real id
             d2 = dict(d)
             d2["rule_id"] = existing.get("id")
             resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d2]})
@@ -223,8 +222,10 @@ def main() -> None:
             else:
                 unchanged += 1
         else:
-            # CREATE: use payload as-is (includes rule_id:0 because your tenant requires it)
-            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d]})
+            # CREATE: keep rule_id as null (NOT 0), so tenant doesn't attempt update(id=0)
+            d_create = dict(d)
+            d_create["rule_id"] = None
+            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d_create]})
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
             print(f"[correlation] create response: added={add_n} updated={upd_n}")
@@ -233,7 +234,7 @@ def main() -> None:
             else:
                 raise SystemExit(f"[correlation] ERROR: expected add, got added={add_n} updated={upd_n}. Full response: {resp}")
 
-        # Verify after upsert
+        # Verify
         objs = get_correlation_by_name(s, base_url, name)
         ids = [o.get("id") for o in objs]
         print(f"[correlation] verify after upsert: count={len(objs)} ids={ids}")
