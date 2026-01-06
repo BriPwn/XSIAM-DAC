@@ -2,12 +2,10 @@
 import argparse
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import yaml
-from sigma.rule import SigmaRule
-from sigma.processing.pipeline import ProcessingPipeline
-from sigma.backends.cortexxsiam import CortexXSIAMBackend
 
 SEVERITY_MAP = {
     "informational": "SEV_010_INFO",
@@ -20,6 +18,11 @@ SEVERITY_MAP = {
 DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ")
 DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 
+# Where the workflow clones Sigma2XSIAM
+SIGMA2XSIAM_DIR = Path(os.getenv("SIGMA2XSIAM_DIR", "vendor/sigma2xsiam"))
+CONVERTER = SIGMA2XSIAM_DIR / "convert_rule.py"
+PIPELINE_YML = SIGMA2XSIAM_DIR / "pipelines" / "cortex_xdm.yml"  # referenced by the project README 
+
 
 def sigma_level_to_xsiam(level: str | None) -> str:
     if not level:
@@ -31,17 +34,55 @@ def sanitize_filename(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
+def ensure_vendor_present() -> None:
+    if not CONVERTER.exists():
+        raise SystemExit(
+            f"Missing Sigma2XSIAM converter at {CONVERTER}. "
+            f"Workflow must clone Sigma2XSIAM into {SIGMA2XSIAM_DIR}."
+        )
+    if not PIPELINE_YML.exists():
+        raise SystemExit(
+            f"Missing pipeline file at {PIPELINE_YML}. "
+            f"Ensure the Sigma2XSIAM repo includes pipelines/cortex_xdm.yml."
+        )
+
+
+def convert_one_sigma(rule_path: Path, tmp_out: Path) -> str:
+    """
+    Uses Sigma2XSIAM's CLI converter script to generate XQL to a file and returns it.
+    The project documents running convert_rule.py for single and batch conversions. 
+    """
+    cmd = [
+        "python",
+        str(CONVERTER),
+        "-r",
+        str(rule_path),
+        "-o",
+        str(tmp_out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"Conversion failed for {rule_path}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}\n"
+        )
+
+    if not tmp_out.exists():
+        # Some converters may only print output; but Sigma2XSIAM supports -o output. 
+        raise SystemExit(f"Converter did not produce output file: {tmp_out}")
+
+    return tmp_out.read_text(encoding="utf-8").strip()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sigma-dir", default="rules/sigma")
     ap.add_argument("--out-xql-dir", default="generated/xql")
     ap.add_argument("--out-corr-dir", default="generated/correlations")
-    ap.add_argument(
-        "--pipeline-yml",
-        default="pipelines/cortex_xdm.yml",
-        help="Processing pipeline YAML (from sigma2xsiam repo)",
-    )
     args = ap.parse_args()
+
+    ensure_vendor_present()
 
     sigma_dir = Path(args.sigma_dir)
     out_xql_dir = Path(args.out_xql_dir)
@@ -49,21 +90,13 @@ def main() -> None:
     out_xql_dir.mkdir(parents=True, exist_ok=True)
     out_corr_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load processing pipeline (required for good XDM field mapping) :contentReference[oaicite:2]{index=2}
-    pipeline_path = Path(args.pipeline_yml)
-    if not pipeline_path.exists():
-        raise SystemExit(
-            f"Missing pipeline file: {pipeline_path}. "
-            f"Ensure the sigma2xsiam repo files are present in your repo at /pipelines."
-        )
-
-    pipeline = ProcessingPipeline.from_yaml(pipeline_path.read_text(encoding="utf-8"))
-    backend = CortexXSIAMBackend(processing_pipeline=pipeline)
-
     sigma_files = sorted(list(sigma_dir.rglob("*.yml")) + list(sigma_dir.rglob("*.yaml")))
     if not sigma_files:
         print(f"No Sigma files found in {sigma_dir}")
         return
+
+    tmp_dir = Path(".tmp_sigma2xsiam")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     for rule_path in sigma_files:
         raw = rule_path.read_text(encoding="utf-8")
@@ -76,11 +109,15 @@ def main() -> None:
         if DAC_MARKER not in desc:
             desc = (desc + "\n\n" + DAC_MARKER).strip()
 
-        sigma_rule = SigmaRule.from_yaml(raw)
+        safe = sanitize_filename(name)
 
-        # Convert: returns list of queries; most rules -> 1
-        xql_query = backend.convert_rule(sigma_rule)[0].strip()
+        tmp_out = tmp_dir / f"{safe}.xql"
+        xql_query = convert_one_sigma(rule_path, tmp_out)
 
+        # Write generated XQL
+        (out_xql_dir / f"{safe}.xql").write_text(xql_query + "\n", encoding="utf-8")
+
+        # Build correlation payload JSON (used by reconciliation)
         corr_payload = {
             "rule_id": 0,
             "name": name,
@@ -99,8 +136,6 @@ def main() -> None:
             "mapping_strategy": "auto",
         }
 
-        safe = sanitize_filename(name)
-        (out_xql_dir / f"{safe}.xql").write_text(xql_query + "\n", encoding="utf-8")
         (out_corr_dir / f"{safe}.json").write_text(json.dumps(corr_payload, indent=2) + "\n", encoding="utf-8")
 
         print(f"Converted: {rule_path} -> {safe}.xql + {safe}.json")
