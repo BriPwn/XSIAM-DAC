@@ -5,7 +5,6 @@ references:
   - https://github.com/mdecrevoisier/EVTX-to-MITRE-Attack/tree/master/TA0006-Credential%20Access/T1558-Steal%20or%20Forge%20Kerberos%20Tickets
   - https://www.trustedsec.com/blog/the-art-of-bypassing-kerberoast-detections-with-orpheus/
   - https://blog.harmj0y.net/redteaming/kerberoasting-revisited/
-  - https://blog.harmj0y.net/powershell/kerberoasting-without-mimikatz/
 tags:
   - attack.credential_access
   - attack.t1558.003
