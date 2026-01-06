@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 from sigma.rule import SigmaRule
 from sigma.processing.pipeline import ProcessingPipeline
-from sigma.backends.cortexxsiam import CortexXSIAMBackend  # <-- correct import
+from sigma.backends.cortexxsiam import CortexXSIAMBackend
 
 SEVERITY_MAP = {
     "informational": "SEV_010_INFO",
