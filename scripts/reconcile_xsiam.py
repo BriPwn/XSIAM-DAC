@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -19,6 +20,13 @@ DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
 VALIDATE_XQL = os.getenv("VALIDATE_XQL", "true").lower() in ("1", "true", "yes")
+
+
+@dataclass
+class NonRetryableHTTP(Exception):
+    status_code: int
+    url: str
+    body: str
 
 
 def must_env(name: str) -> str:
@@ -54,11 +62,6 @@ def parse_objects_count(resp: dict) -> Optional[int]:
 
 
 def raise_on_api_errors(endpoint: str, resp: dict) -> None:
-    """
-    Some XSIAM endpoints return either:
-      - {"reply": {"err_code": ..., "err_msg": ..., "err_extra": ...}}
-      - or top-level "errors": [...]
-    """
     errors = resp.get("errors") or []
     if errors:
         raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
@@ -78,6 +81,10 @@ def raise_on_api_errors(endpoint: str, resp: dict) -> None:
 
 
 def http_post(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
+    """
+    - Raises NonRetryableHTTP for 4xx (except 429)
+    - Retries on 429/5xx/599
+    """
     url = f"{base_url}{path}"
 
     if DRY_RUN and path.endswith("/insert"):
@@ -92,7 +99,7 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
             # Non-retryable 4xx (except 429)
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 body = (r.text or "")[:4000]
-                raise SystemExit(f"Non-retryable HTTP {r.status_code} from {url}\nBody:\n{body}")
+                raise NonRetryableHTTP(r.status_code, url, body)
 
             # Retry-worthy statuses
             if r.status_code in (429, 500, 502, 503, 504, 599):
@@ -104,7 +111,7 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
             raise_on_api_errors(path, data)
             return data
 
-        except SystemExit:
+        except NonRetryableHTTP:
             raise
         except (ConnectionError, Timeout, HTTPError) as e:
             last_exc = e
@@ -193,14 +200,15 @@ def _epoch_ms(dt: datetime) -> int:
 
 def validate_xql_or_die(session: requests.Session, base_url: str, xql: str) -> None:
     """
-    Validates query syntax/fields by running a cheap XQL query API call.
-    This endpoint returns detailed err_extra.err_msg when the query is invalid. :contentReference[oaicite:1]{index=1}
+    Optional pre-validation to surface detailed XQL errors.
     """
     if not VALIDATE_XQL:
         return
 
-    # Make it cheap: ensure limit 1 (won't fix invalid XQL, but keeps cost minimal)
-    q = xql.strip()
+    q = (xql or "").strip()
+    if not q:
+        raise SystemExit("[XQL] Empty xql_query in desired payload")
+
     if "| limit" not in q.lower():
         q = q + " | limit 1"
 
@@ -215,19 +223,66 @@ def validate_xql_or_die(session: requests.Session, base_url: str, xql: str) -> N
         }
     }
 
-    # We *expect* this to succeed fast if syntax is OK; if it fails, stop before insert
     try:
         resp = http_post(session, base_url, "/public_api/v1/xql/start_xql_query", payload)
-    except SystemExit as e:
-        raise
+    except NonRetryableHTTP as e:
+        # If validation itself fails, print body and exit (this is useful detail)
+        raise SystemExit(f"[XQL] Validation failed: HTTP {e.status_code} {e.url}\nBody:\n{e.body}")
 
-    # Some successful replies include "reply": {"query_id": "..."}; we don’t need to fetch results.
-    # If you want, you can log the returned query_id:
     rep = resp.get("reply")
     if isinstance(rep, dict) and rep.get("query_id"):
         print(f"[XQL] validate ok: query_id={rep.get('query_id')}")
     else:
         print("[XQL] validate ok")
+
+
+def _try_insert_with_shapes(
+    session: requests.Session,
+    base_url: str,
+    correlation_obj: dict,
+    shapes: List[str],
+) -> dict:
+    """
+    Attempt /correlations/insert with multiple create 'shapes' because some tenants
+    inconsistently handle rule_id for create. Docs show rule_id=0 in samples, but some
+    tenants treat rule_id=0 as update. :contentReference[oaicite:1]{index=1}
+    """
+    last_err: Optional[str] = None
+    for shape in shapes:
+        obj = dict(correlation_obj)
+
+        if shape == "omit_rule_id":
+            obj.pop("rule_id", None)
+        elif shape == "rule_id_null":
+            obj["rule_id"] = None
+        elif shape == "rule_id_zero":
+            obj["rule_id"] = 0
+        else:
+            raise ValueError(f"Unknown shape: {shape}")
+
+        print(f"[correlation] insert attempt shape={shape}")
+
+        try:
+            resp = http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [obj]})
+            return resp
+        except NonRetryableHTTP as e:
+            # Only try another shape on 400 (Bad Request). For anything else, stop.
+            if e.status_code != 400:
+                raise SystemExit(f"Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+
+            last_err = e.body
+            # If tenant explicitly complains about update(id=0), don't keep trying zero.
+            if "Correlation rule: 0 does not exist" in e.body:
+                print("[correlation] server treated rule_id=0 as update; will not use rule_id_zero for create")
+                continue
+
+            # Generic "Failed to create correlation rule" -> try next shape
+            continue
+
+    raise SystemExit(
+        "All create-shape attempts failed for /correlations/insert.\n"
+        f"Last 400 body:\n{(last_err or '')}"
+    )
 
 
 def main() -> None:
@@ -267,15 +322,19 @@ def main() -> None:
         name = d["name"].strip()
         print(f"[correlation] attempting upsert: {name}")
 
-        # ✅ Validate XQL first (this is where you'll get the real error message)
         validate_xql_or_die(s, base_url, d.get("xql_query", ""))
 
         existing = remote_by_name.get(name)
 
         if existing:
+            # UPDATE: set rule_id to existing id
             d2 = dict(d)
             d2["rule_id"] = existing.get("id")
-            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d2]})
+            try:
+                resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d2]})
+            except NonRetryableHTTP as e:
+                raise SystemExit(f"Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
             print(f"[correlation] update response: added={add_n} updated={upd_n}")
@@ -284,15 +343,19 @@ def main() -> None:
             else:
                 unchanged += 1
         else:
-            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d]})
+            # CREATE: try multiple shapes (omit/null/0)
+            resp = _try_insert_with_shapes(
+                s,
+                base_url,
+                d,
+                shapes=["omit_rule_id", "rule_id_null", "rule_id_zero"],
+            )
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
             print(f"[correlation] create response: added={add_n} updated={upd_n}")
             if add_n > 0:
                 created += 1
             else:
-                # If insert returns a generic "Failed to create correlation rule", validation should have already
-                # surfaced the root cause. This is here as a fallback.
                 raise SystemExit(f"[correlation] ERROR: expected add, got added={add_n} updated={upd_n}. Full response: {resp}")
 
         # Verify after upsert
