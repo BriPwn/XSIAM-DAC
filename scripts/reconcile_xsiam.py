@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -15,7 +16,9 @@ from requests.exceptions import ConnectionError, HTTPError, Timeout
 
 DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ")
 DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
+
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
+VALIDATE_XQL = os.getenv("VALIDATE_XQL", "true").lower() in ("1", "true", "yes")
 
 
 def must_env(name: str) -> str:
@@ -46,14 +49,26 @@ def parse_objects_count(resp: dict) -> Optional[int]:
         return resp["objects_count"]
     rep = resp.get("reply")
     if isinstance(rep, dict) and isinstance(rep.get("objects_count"), int):
-        return rep["objects_count"]
+        return rep.get("objects_count")
     return None
 
 
 def raise_on_api_errors(endpoint: str, resp: dict) -> None:
+    """
+    Some XSIAM endpoints return either:
+      - {"reply": {"err_code": ..., "err_msg": ..., "err_extra": ...}}
+      - or top-level "errors": [...]
+    """
     errors = resp.get("errors") or []
     if errors:
         raise SystemExit(f"XSIAM API returned errors for {endpoint}: {errors}")
+
+    rep = resp.get("reply")
+    if isinstance(rep, dict) and rep.get("err_code"):
+        raise SystemExit(
+            f"XSIAM API error for {endpoint}: err_code={rep.get('err_code')} "
+            f"err_msg={rep.get('err_msg')} err_extra={rep.get('err_extra')}"
+        )
 
     if "err_code" in resp and resp.get("err_code"):
         raise SystemExit(
@@ -74,10 +89,12 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
         try:
             r = session.post(url, json=payload, timeout=(10, 180))
 
+            # Non-retryable 4xx (except 429)
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 body = (r.text or "")[:4000]
                 raise SystemExit(f"Non-retryable HTTP {r.status_code} from {url}\nBody:\n{body}")
 
+            # Retry-worthy statuses
             if r.status_code in (429, 500, 502, 503, 504, 599):
                 body = (r.text or "")[:1200]
                 raise HTTPError(f"HTTP {r.status_code} from {url}. Body: {body}", response=r)
@@ -145,7 +162,6 @@ def load_desired_correlations() -> List[dict]:
     for p in files:
         obj = json.loads(p.read_text(encoding="utf-8"))
 
-        # enforce managed scoping
         if not obj["name"].startswith(DAC_PREFIX):
             obj["name"] = f"{DAC_PREFIX}{obj['name']}"
 
@@ -171,10 +187,54 @@ def get_correlation_by_name(session: requests.Session, base_url: str, name: str)
     return parse_objects(resp)
 
 
+def _epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def validate_xql_or_die(session: requests.Session, base_url: str, xql: str) -> None:
+    """
+    Validates query syntax/fields by running a cheap XQL query API call.
+    This endpoint returns detailed err_extra.err_msg when the query is invalid. :contentReference[oaicite:1]{index=1}
+    """
+    if not VALIDATE_XQL:
+        return
+
+    # Make it cheap: ensure limit 1 (won't fix invalid XQL, but keeps cost minimal)
+    q = xql.strip()
+    if "| limit" not in q.lower():
+        q = q + " | limit 1"
+
+    now = datetime.now(timezone.utc)
+    frm = now - timedelta(hours=1)
+
+    payload = {
+        "request_data": {
+            "query": q,
+            "tenants": [],
+            "timeframe": {"from": _epoch_ms(frm), "to": _epoch_ms(now)},
+        }
+    }
+
+    # We *expect* this to succeed fast if syntax is OK; if it fails, stop before insert
+    try:
+        resp = http_post(session, base_url, "/public_api/v1/xql/start_xql_query", payload)
+    except SystemExit as e:
+        raise
+
+    # Some successful replies include "reply": {"query_id": "..."}; we don’t need to fetch results.
+    # If you want, you can log the returned query_id:
+    rep = resp.get("reply")
+    if isinstance(rep, dict) and rep.get("query_id"):
+        print(f"[XQL] validate ok: query_id={rep.get('query_id')}")
+    else:
+        print("[XQL] validate ok")
+
+
 def main() -> None:
     print("=== RECONCILE_XSIAM.PY START ===")
     print(f"[RECON] cwd={Path.cwd()}")
     print(f"[RECON] DRY_RUN={DRY_RUN}")
+    print(f"[RECON] VALIDATE_XQL={VALIDATE_XQL}")
 
     base_url = normalize_base_url(must_env("XSIAM_FQDN"))
     api_key = must_env("XSIAM_API_KEY")
@@ -207,10 +267,12 @@ def main() -> None:
         name = d["name"].strip()
         print(f"[correlation] attempting upsert: {name}")
 
+        # ✅ Validate XQL first (this is where you'll get the real error message)
+        validate_xql_or_die(s, base_url, d.get("xql_query", ""))
+
         existing = remote_by_name.get(name)
 
         if existing:
-            # UPDATE: overwrite rule_id with real id
             d2 = dict(d)
             d2["rule_id"] = existing.get("id")
             resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d2]})
@@ -222,19 +284,18 @@ def main() -> None:
             else:
                 unchanged += 1
         else:
-            # CREATE: keep rule_id as null (NOT 0), so tenant doesn't attempt update(id=0)
-            d_create = dict(d)
-            d_create["rule_id"] = None
-            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d_create]})
+            resp = http_post(s, base_url, "/public_api/v1/correlations/insert", {"request_data": [d]})
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
             print(f"[correlation] create response: added={add_n} updated={upd_n}")
             if add_n > 0:
                 created += 1
             else:
+                # If insert returns a generic "Failed to create correlation rule", validation should have already
+                # surfaced the root cause. This is here as a fallback.
                 raise SystemExit(f"[correlation] ERROR: expected add, got added={add_n} updated={upd_n}. Full response: {resp}")
 
-        # Verify
+        # Verify after upsert
         objs = get_correlation_by_name(s, base_url, name)
         ids = [o.get("id") for o in objs]
         print(f"[correlation] verify after upsert: count={len(objs)} ids={ids}")
