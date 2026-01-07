@@ -15,7 +15,7 @@ detection:
     reduction:
         - ServiceName: '$*'
     timeframe: 1m
-    condition: selection and not reduction | count() by EventID > 20 
+    condition: selection and not reduction 
 falsepositives:
     - Service accounts used on legacy systems (e.g. NetApp)
     - Windows Domains with DFL 2003 and legacy systems
