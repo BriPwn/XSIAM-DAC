@@ -126,19 +126,39 @@ def dataset_for_query(xql: str) -> str:
 
 
 # --- XQL FIXUPS ---
-# Tenant expects string values for these XDM fields, but converter emits numbers.
-# Convert: field = 123 -> field = "123"
+# Quote numeric literals for known string-typed XDM fields in your tenant:
 _STRING_TYPED_INT_FIELDS = [
     r"xdm\.event\.id",
     r"xdm\.auth\.kerberos_tgs\.encryption_type",
 ]
+_FIXUPS = [re.compile(rf"(\b{field}\s*=\s*)(\d+)(\b)") for field in _STRING_TYPED_INT_FIELDS]
 
-_FIXUPS = [
-    re.compile(rf"(\b{field}\s*=\s*)(\d+)(\b)") for field in _STRING_TYPED_INT_FIELDS
-]
+# Remove "Status=..." which is not a valid XDM field in XQL
+# Handles: "... and Status=0 and ..." or "Status = 0 and ..." or "... and Status=0"
+_STATUS_CLAUSE = re.compile(r"\bStatus\s*=\s*([0-9]+|\"[^\"]+\")\b", re.IGNORECASE)
 
 
-def fixup_xql_types(xql: str) -> str:
+def _remove_status_clause(xql: str) -> str:
+    if "Status" not in xql and "status" not in xql:
+        return xql
+
+    # Remove the clause itself
+    x = _STATUS_CLAUSE.sub("", xql)
+
+    # Clean up common dangling operators created by removal:
+    x = re.sub(r"\s+and\s+\s+and\s+", " and ", x, flags=re.IGNORECASE)
+    x = re.sub(r"\|\s*filter\s*and\s+", "| filter ", x, flags=re.IGNORECASE)
+    x = re.sub(r"\s+and\s*\)", " )", x, flags=re.IGNORECASE)
+    x = re.sub(r"\(\s*and\s+", "(", x, flags=re.IGNORECASE)
+    x = re.sub(r"\s{2,}", " ", x).strip()
+
+    # Also fix occurrences like "filter  and"
+    x = re.sub(r"\|\s*filter\s+and\s+", "| filter ", x, flags=re.IGNORECASE)
+
+    return x
+
+
+def fixup_xql(xql: str) -> str:
     if not xql:
         return xql
 
@@ -146,7 +166,8 @@ def fixup_xql_types(xql: str) -> str:
     for rx in _FIXUPS:
         out = rx.sub(r'\1"\2"\3', out)
 
-    return out
+    out2 = _remove_status_clause(out)
+    return out2
 
 
 def main() -> None:
@@ -201,7 +222,7 @@ def main() -> None:
             tmp_rule.write_text(yaml.safe_dump(rule_dict, sort_keys=False), encoding="utf-8")
 
             xql_raw = convert_one_sigma_to_xql(tmp_rule)
-            xql_query = fixup_xql_types(xql_raw)
+            xql_query = fixup_xql(xql_raw)
 
             if xql_query != xql_raw:
                 print(f"[GEN] XQL fixups applied for {rule_path.name} doc={doc_idx}")
@@ -211,7 +232,6 @@ def main() -> None:
             written_xql += 1
 
             corr_payload = {
-                # Create: keep key present but NOT 0 (0 is treated as update in your tenant)
                 "rule_id": None,
 
                 "name": name,
