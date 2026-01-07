@@ -1,71 +1,42 @@
-name: XSIAM Detections-as-Code
+name: XSIAM Correlations as Code
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
+    paths:
+      - "rules/correlations/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - ".github/workflows/xsiam_detections_pipeline.yml"
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Plan only (do not apply to XSIAM)"
-        required: true
-        default: "false"
 
 permissions:
   contents: read
 
 jobs:
-  dac:
+  reconcile:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout detections repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "PyYAML==6.0.3" "requests==2.32.5" "pysigma==1.0.2"
+          pip install -r requirements.txt
 
-      - name: Clone Sigma2XSIAM (public)
-        run: |
-          rm -rf vendor/Sigma2XSIAM
-          git clone https://github.com/gocortexio/sigma2xsiam.git vendor/Sigma2XSIAM
-          test -f vendor/Sigma2XSIAM/convert_rule.py
-          test -f vendor/Sigma2XSIAM/pipelines/cortex_xdm.yml
-
-      - name: Generate XQL + correlation payloads
-        env:
-          SIGMA2XSIAM_DIR: "vendor/Sigma2XSIAM"
-          DAC_PREFIX: "DAC: "
-          DAC_MARKER: "Managed by detections-as-code"
-        run: |
-          set -euxo pipefail
-          python -u scripts/sigma_to_xql.py
-          echo "=== POST-GENERATE CHECK ==="
-          pwd
-          ls -la
-          ls -la generated || true
-          ls -la generated/correlations || true
-          test -d generated/correlations
-          test "$(ls -1 generated/correlations/*.json | wc -l)" -ge 1
-
-      - name: Reconcile into XSIAM (UPLOAD)
+      - name: Reconcile correlations into XSIAM
         env:
           XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
           XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
           XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          DRY_RUN: "false"
           DAC_PREFIX: "DAC: "
           DAC_MARKER: "Managed by detections-as-code"
         run: |
-          set -euxo pipefail
-          echo "=== ABOUT TO RUN RECONCILE ==="
-          pwd
-          ls -la generated/correlations || true
           python -u scripts/reconcile_xsiam.py
-
-
