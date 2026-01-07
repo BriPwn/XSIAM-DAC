@@ -11,8 +11,8 @@ Behavior:
 - VERIFY: GET by name after upsert
 
 Notes:
-- This script does NOT mutate rule payloads by default (important for "known-good" rules).
-- If you *want* to enforce a name prefix and/or description marker, enable:
+- Does NOT mutate rule payloads by default (important for "known-good" rules).
+- If you want enforced naming/marking, enable:
     ENFORCE_PREFIX=true and/or ENFORCE_MARKER=true
 """
 
@@ -24,7 +24,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -141,6 +141,7 @@ def parse_objects_count(resp: dict) -> Optional[int]:
 
 
 def paged_get_all_correlations(session: requests.Session, base_url: str, page_size: int = 100) -> List[dict]:
+    # still useful for export, but NOT used for reconcile decisions
     if page_size <= 0 or page_size > 100:
         raise ValueError("page_size must be 1..100")
 
@@ -173,15 +174,6 @@ def get_correlation_by_name(session: requests.Session, base_url: str, name: str)
     }
     resp = http_post(session, base_url, "/public_api/v1/correlations/get", payload)
     return parse_objects(resp)
-
-
-def index_by_name(objs: List[dict]) -> Dict[str, dict]:
-    m: Dict[str, dict] = {}
-    for o in objs:
-        n = (o.get("name") or "").strip()
-        if n and n not in m:
-            m[n] = o
-    return m
 
 
 def _ensure_list_of_objects(parsed: Any, path: Path) -> List[dict]:
@@ -286,7 +278,18 @@ def update_rule(session: requests.Session, base_url: str, obj: dict, rule_id: An
 
 
 def extract_rule_id(existing: dict) -> Any:
+    # Most tenants return "id". Some may return rule_id/ruleId.
     return existing.get("id") or existing.get("rule_id") or existing.get("ruleId")
+
+
+def _resp_list(resp: dict, key: str) -> list:
+    # Some tenants may wrap under reply; keep robust.
+    if isinstance(resp.get(key), list):
+        return resp[key]
+    rep = resp.get("reply")
+    if isinstance(rep, dict) and isinstance(rep.get(key), list):
+        return rep[key]
+    return []
 
 
 def main() -> None:
@@ -317,10 +320,6 @@ def main() -> None:
     local = load_local_correlations()
     print(f"[RECON] desired correlations={len(local)}")
 
-    remote = paged_get_all_correlations(s, base_url, page_size=100)
-    remote_by_name = index_by_name(remote)
-    print(f"[RECON] remote correlations fetched={len(remote)}")
-
     created = updated = unchanged = 0
 
     for obj in local:
@@ -330,40 +329,35 @@ def main() -> None:
 
         print(f"[correlation] upsert by name: {name}")
 
-        existing = remote_by_name.get(name)
+        # Critical change: always resolve existence by name (no full export dependency)
+        existing_list = get_correlation_by_name(s, base_url, name)
+        existing = existing_list[0] if existing_list else None
 
         if existing:
             rid = extract_rule_id(existing)
             if not rid:
-                by_name = get_correlation_by_name(s, base_url, name)
-                if by_name:
-                    rid = extract_rule_id(by_name[0])
-            if not rid:
-                raise SystemExit(f"[correlation] Could not determine rule_id for existing correlation: {name}")
+                raise SystemExit(f"[correlation] Could not determine id for existing rule: {name}")
 
             resp = update_rule(s, base_url, obj, rid)
-            add_n = len(resp.get("added_objects") or [])
-            upd_n = len(resp.get("updated_objects") or [])
+            add_n = len(_resp_list(resp, "added_objects"))
+            upd_n = len(_resp_list(resp, "updated_objects"))
             print(f"[correlation] update response: added={add_n} updated={upd_n}")
-            if upd_n > 0:
-                updated += 1
-            else:
-                unchanged += 1
+
+            # Some tenants don't populate updated_objects reliably; treat as updated if we took update path
+            updated += 1
         else:
             resp = create_with_shape_fallback(s, base_url, obj)
-            add_n = len(resp.get("added_objects") or [])
-            upd_n = len(resp.get("updated_objects") or [])
+            add_n = len(_resp_list(resp, "added_objects"))
+            upd_n = len(_resp_list(resp, "updated_objects"))
             print(f"[correlation] create response: added={add_n} updated={upd_n}")
-            if add_n > 0:
-                created += 1
-            else:
-                raise SystemExit(f"[correlation] Create returned no added_objects. Full response: {resp}")
+            created += 1
 
+        # Verify
         verify = get_correlation_by_name(s, base_url, name)
-        ids = [v.get("id") for v in verify]
-        print(f"[correlation] verify: count={len(verify)} ids={ids}")
         if not verify:
             raise SystemExit(f"[correlation] Verify failed: correlation not found after upsert: {name}")
+        vid = extract_rule_id(verify[0])
+        print(f"[correlation] verify ok: id={vid}")
 
     print(f"[RECON] Summary: created={created} updated={updated} unchanged={unchanged}")
 
