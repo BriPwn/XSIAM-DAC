@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
@@ -119,10 +120,22 @@ def stable_hash(s: str) -> str:
 
 
 def dataset_for_query(xql: str) -> str:
-    # Your converter emits: "datamodel dataset = * | ..."
     if "datamodel dataset = *" in xql:
         return "*"
     return "xdr_data"
+
+
+# --- XQL FIXUPS ---
+# Your tenant says xdm.event.id expects a string; vendor converter emits number.
+# We rewrite: xdm.event.id=12345  -> xdm.event.id="12345"
+# Also handle optional whitespace around '=' and avoid double-quoting if already quoted.
+_XDM_EVENT_ID_NUM = re.compile(r'(\bxdm\.event\.id\s*=\s*)(\d+)(\b)')
+def fixup_xql_types(xql: str) -> str:
+    if not xql:
+        return xql
+    # Only quote when RHS is bare digits and not already quoted
+    xql2 = _XDM_EVENT_ID_NUM.sub(r'\1"\2"\3', xql)
+    return xql2
 
 
 def main() -> None:
@@ -176,15 +189,18 @@ def main() -> None:
             tmp_rule = tmp_dir / f"{safe}.yml"
             tmp_rule.write_text(yaml.safe_dump(rule_dict, sort_keys=False), encoding="utf-8")
 
-            xql_query = convert_one_sigma_to_xql(tmp_rule)
+            xql_query_raw = convert_one_sigma_to_xql(tmp_rule)
+            xql_query = fixup_xql_types(xql_query_raw)
+
+            if xql_query != xql_query_raw:
+                print(f"[GEN] XQL fixups applied for {rule_path.name} doc={doc_idx}")
 
             xql_path = out_xql_dir / f"{safe}.xql"
             xql_path.write_text(xql_query + "\n", encoding="utf-8")
             written_xql += 1
 
-            # ✅ CREATE: rule_id must exist in your tenant, but rule_id=0 is treated as UPDATE.
-            # So we set rule_id=null here; reconcile will set real rule_id for updates.
             corr_payload = {
+                # Create: keep key present but NOT 0 (0 is treated as update in your tenant)
                 "rule_id": None,
 
                 "name": name,
