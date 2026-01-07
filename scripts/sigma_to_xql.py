@@ -126,16 +126,27 @@ def dataset_for_query(xql: str) -> str:
 
 
 # --- XQL FIXUPS ---
-# Your tenant says xdm.event.id expects a string; vendor converter emits number.
-# We rewrite: xdm.event.id=12345  -> xdm.event.id="12345"
-# Also handle optional whitespace around '=' and avoid double-quoting if already quoted.
-_XDM_EVENT_ID_NUM = re.compile(r'(\bxdm\.event\.id\s*=\s*)(\d+)(\b)')
+# Tenant expects string values for these XDM fields, but converter emits numbers.
+# Convert: field = 123 -> field = "123"
+_STRING_TYPED_INT_FIELDS = [
+    r"xdm\.event\.id",
+    r"xdm\.auth\.kerberos_tgs\.encryption_type",
+]
+
+_FIXUPS = [
+    re.compile(rf"(\b{field}\s*=\s*)(\d+)(\b)") for field in _STRING_TYPED_INT_FIELDS
+]
+
+
 def fixup_xql_types(xql: str) -> str:
     if not xql:
         return xql
-    # Only quote when RHS is bare digits and not already quoted
-    xql2 = _XDM_EVENT_ID_NUM.sub(r'\1"\2"\3', xql)
-    return xql2
+
+    out = xql
+    for rx in _FIXUPS:
+        out = rx.sub(r'\1"\2"\3', out)
+
+    return out
 
 
 def main() -> None:
@@ -189,10 +200,10 @@ def main() -> None:
             tmp_rule = tmp_dir / f"{safe}.yml"
             tmp_rule.write_text(yaml.safe_dump(rule_dict, sort_keys=False), encoding="utf-8")
 
-            xql_query_raw = convert_one_sigma_to_xql(tmp_rule)
-            xql_query = fixup_xql_types(xql_query_raw)
+            xql_raw = convert_one_sigma_to_xql(tmp_rule)
+            xql_query = fixup_xql_types(xql_raw)
 
-            if xql_query != xql_query_raw:
+            if xql_query != xql_raw:
                 print(f"[GEN] XQL fixups applied for {rule_path.name} doc={doc_idx}")
 
             xql_path = out_xql_dir / f"{safe}.xql"
