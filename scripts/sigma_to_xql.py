@@ -116,7 +116,10 @@ def convert_one_sigma_to_xql(single_rule_path: Path) -> str:
 
 
 def stable_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16
+
+
+    ]
 
 
 # --- XQL FIXUPS (type + field cleanup) ---
@@ -143,8 +146,12 @@ def _remove_status_clause(xql: str) -> str:
 
 
 def _rewrite_datamodel_to_dataset(xql: str, dataset: str = "xdr_data") -> str:
-    # Convert "datamodel dataset = * | ..." to "dataset = xdr_data | ..."
-    return re.sub(r"^\s*datamodel\s+dataset\s*=\s*\*\s*\|", f"dataset = {dataset} |", xql.strip(), flags=re.IGNORECASE)
+    return re.sub(
+        r"^\s*datamodel\s+dataset\s*=\s*\*\s*\|",
+        f"dataset = {dataset} |",
+        xql.strip(),
+        flags=re.IGNORECASE,
+    )
 
 
 def fixup_xql(xql: str) -> str:
@@ -221,42 +228,41 @@ def main() -> None:
             xql_path.write_text(xql_query + "\n", encoding="utf-8")
             written_xql += 1
 
-            # IMPORTANT:
-            # Emit ONLY the fields documented for /correlations/insert. :contentReference[oaicite:2]{index=2}
+            # Correlation insert payload: include action=ALERTS so alert/severity fields are valid.
             corr_payload = {
-                # NOTE: Do NOT include rule_id here; create will omit it, update sets it in reconcile. :contentReference[oaicite:3]{index=3}
-
                 "name": name,
-                "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
-                "xql_query": xql_query,
-                "is_enabled": True,
                 "description": desc,
 
-                "alert_name": name,
-                "alert_category": "OTHER",
-                "alert_description": desc,
-                "alert_fields": {},
+                "action": "ALERTS",  # ✅ critical fix for your tenant
 
+                "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
+                "user_defined_severity": None,
+
+                "xql_query": xql_query,
+                "dataset": "xdr_data",
+
+                "is_enabled": True,
                 "execution_mode": "SCHEDULED",
                 "search_window": "2 hours",
                 "simple_schedule": "5 minutes",
                 "timezone": "Etc/UTC",
                 "crontab": "*/5 * * * *",
 
+                "alert_name": name,
+                "alert_description": desc,
+                "alert_category": "OTHER",
+                "user_defined_category": None,
+
+                "alert_fields": {},
+                "mitre_defs": {},
+
                 "suppression_enabled": True,
                 "suppression_duration": "1 hours",
                 "suppression_fields": ["event_type"],
 
-                "dataset": "xdr_data",
-                "user_defined_severity": None,
-                "user_defined_category": None,
-
-                "mitre_defs": {},
-
+                "mapping_strategy": "AUTO",
                 "investigation_query_link": xql_query,
                 "drilldown_query_timeframe": "QUERY",
-
-                "mapping_strategy": "AUTO",
             }
 
             corr_path = out_corr_dir / f"{safe}.json"
@@ -265,7 +271,7 @@ def main() -> None:
 
             print(f"[GEN] OK {rule_path} doc={doc_idx}/{len(docs)} -> {corr_path.name}")
 
-    corr_files = sorted([p for p in out_corr_dir.glob('*.json') if p.name != ".gitkeep"])
+    corr_files = sorted([p for p in out_corr_dir.glob("*.json") if p.name != ".gitkeep"])
     print(f"[GEN] wrote_xql={written_xql} wrote_corr={written_corr}")
     print(f"[GEN] disk_corr_files={len(corr_files)}")
     if len(corr_files) == 0:
