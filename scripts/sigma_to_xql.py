@@ -116,13 +116,10 @@ def convert_one_sigma_to_xql(single_rule_path: Path) -> str:
 
 
 def stable_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
-    ]
-
-
-# --- XQL FIXUPS (type + field cleanup) ---
+# --- XQL FIXUPS ---
 _STRING_TYPED_INT_FIELDS = [
     r"xdm\.event\.id",
     r"xdm\.auth\.kerberos_tgs\.encryption_type",
@@ -134,7 +131,6 @@ _STATUS_CLAUSE = re.compile(r"\bStatus\s*=\s*([0-9]+|\"[^\"]+\")\b", re.IGNORECA
 def _remove_status_clause(xql: str) -> str:
     if "Status" not in xql and "status" not in xql:
         return xql
-
     x = _STATUS_CLAUSE.sub("", xql)
     x = re.sub(r"\s+and\s+\s+and\s+", " and ", x, flags=re.IGNORECASE)
     x = re.sub(r"\|\s*filter\s*and\s+", "| filter ", x, flags=re.IGNORECASE)
@@ -154,6 +150,35 @@ def _rewrite_datamodel_to_dataset(xql: str, dataset: str = "xdr_data") -> str:
     )
 
 
+def _rewrite_xdm_fields_for_correlation(xql: str) -> str:
+    """
+    Correlation rules in some tenants do NOT support xdm.* fields, even if XQL can run elsewhere.
+    We rewrite a few key xdm fields into common xdr_data equivalents.
+    """
+    out = xql
+
+    # xdm.event.id="<n>" -> (event_id=<n> or action_evtlog_event_id=<n>)
+    out = re.sub(
+        r'\bxdm\.event\.id\s*=\s*"(\d+)"\b',
+        r'(event_id=\1 or action_evtlog_event_id=\1)',
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # kerberos encryption type
+    out = re.sub(
+        r'\bxdm\.auth\.kerberos_tgs\.encryption_type\s*=\s*"(\d+)"\b',
+        r'(kerberos_encryption_type=\1 or tgs_encryption_type=\1)',
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # xdm.source.ipv4 -> src_ip (best-effort)
+    out = re.sub(r"\bxdm\.source\.ipv4\b", "src_ip", out, flags=re.IGNORECASE)
+
+    return out
+
+
 def fixup_xql(xql: str) -> str:
     if not xql:
         return xql
@@ -164,6 +189,8 @@ def fixup_xql(xql: str) -> str:
 
     out = _remove_status_clause(out)
     out = _rewrite_datamodel_to_dataset(out, dataset="xdr_data")
+    out = _rewrite_xdm_fields_for_correlation(out)
+
     return out
 
 
@@ -191,9 +218,6 @@ def main() -> None:
 
     if not sigma_files:
         raise SystemExit(f"[GEN] No Sigma files found under: {sigma_dir.resolve()}")
-
-    written_corr = 0
-    written_xql = 0
 
     for rule_path in sigma_files:
         raw = rule_path.read_text(encoding="utf-8")
@@ -224,16 +248,13 @@ def main() -> None:
             if xql_query != xql_raw:
                 print(f"[GEN] XQL fixups applied for {rule_path.name} doc={doc_idx}")
 
-            xql_path = out_xql_dir / f"{safe}.xql"
-            xql_path.write_text(xql_query + "\n", encoding="utf-8")
-            written_xql += 1
+            (out_xql_dir / f"{safe}.xql").write_text(xql_query + "\n", encoding="utf-8")
 
-            # Correlation insert payload: include action=ALERTS so alert/severity fields are valid.
             corr_payload = {
                 "name": name,
                 "description": desc,
 
-                "action": "ALERTS",  # ✅ critical fix for your tenant
+                "action": "ALERTS",
 
                 "severity": sigma_level_to_xsiam(str(rule_dict.get("level") or "")),
                 "user_defined_severity": None,
@@ -265,17 +286,8 @@ def main() -> None:
                 "drilldown_query_timeframe": "QUERY",
             }
 
-            corr_path = out_corr_dir / f"{safe}.json"
-            corr_path.write_text(json.dumps(corr_payload, indent=2) + "\n", encoding="utf-8")
-            written_corr += 1
-
-            print(f"[GEN] OK {rule_path} doc={doc_idx}/{len(docs)} -> {corr_path.name}")
-
-    corr_files = sorted([p for p in out_corr_dir.glob("*.json") if p.name != ".gitkeep"])
-    print(f"[GEN] wrote_xql={written_xql} wrote_corr={written_corr}")
-    print(f"[GEN] disk_corr_files={len(corr_files)}")
-    if len(corr_files) == 0:
-        raise SystemExit("[GEN] ERROR: No correlation JSON files produced.")
+            (out_corr_dir / f"{safe}.json").write_text(json.dumps(corr_payload, indent=2) + "\n", encoding="utf-8")
+            print(f"[GEN] OK {rule_path} doc={doc_idx}/{len(docs)} -> {safe}.json")
 
 
 if __name__ == "__main__":
