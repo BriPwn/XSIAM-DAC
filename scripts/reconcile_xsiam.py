@@ -2,11 +2,18 @@
 """
 Correlation-only reconciliation for Cortex XSIAM.
 
-- Source of truth: rules/correlations/*.json
-- Upsert key: correlation "name" (string, unique)
-- Create: /public_api/v1/correlations/insert with rule_id omitted (fallback rule_id=null)
-- Update: /public_api/v1/correlations/insert with rule_id set to existing id
-- Verifies existence by name after each upsert
+Source of truth: rules/correlations/*.json
+Upsert key: correlation "name"
+
+Behavior:
+- CREATE: POST /public_api/v1/correlations/insert with rule_id omitted (fallback rule_id=null)
+- UPDATE: POST /public_api/v1/correlations/insert with rule_id set to existing id
+- VERIFY: GET by name after upsert
+
+Notes:
+- This script does NOT mutate rule payloads by default (important for "known-good" rules).
+- If you *want* to enforce a name prefix and/or description marker, enable:
+    ENFORCE_PREFIX=true and/or ENFORCE_MARKER=true
 """
 
 from __future__ import annotations
@@ -17,7 +24,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlparse
 
 import requests
@@ -25,10 +32,13 @@ from requests.exceptions import ConnectionError, HTTPError, Timeout
 
 # -------- Config (env) --------
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
-DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ").strip() or "DAC: "
-DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 
 CORR_DIR = Path(os.getenv("CORRELATIONS_DIR", "rules/correlations"))
+
+ENFORCE_PREFIX = os.getenv("ENFORCE_PREFIX", "false").lower() in ("1", "true", "yes")
+ENFORCE_MARKER = os.getenv("ENFORCE_MARKER", "false").lower() in ("1", "true", "yes")
+DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ").strip() or "DAC: "
+DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 
 
 # -------- Errors --------
@@ -174,6 +184,19 @@ def index_by_name(objs: List[dict]) -> Dict[str, dict]:
     return m
 
 
+def _ensure_list_of_objects(parsed: Any, path: Path) -> List[dict]:
+    """
+    Accept either:
+      - single JSON object (dict)
+      - list of JSON objects (list[dict])
+    """
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list) and all(isinstance(x, dict) for x in parsed):
+        return parsed
+    raise SystemExit(f"[LOCAL] {path} must be a JSON object or list of objects.")
+
+
 def load_local_correlations() -> List[dict]:
     if not CORR_DIR.exists():
         raise SystemExit(f"Correlation directory not found: {CORR_DIR.resolve()}")
@@ -187,30 +210,35 @@ def load_local_correlations() -> List[dict]:
     seen_names: Dict[str, Path] = {}
 
     for p in files:
-        obj = json.loads(p.read_text(encoding="utf-8"))
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+        objs = _ensure_list_of_objects(parsed, p)
 
-        name = (obj.get("name") or "").strip()
-        if not name:
-            raise SystemExit(f"[LOCAL] Missing required field 'name' in {p}")
+        for obj in objs:
+            name = (obj.get("name") or "").strip()
+            if not name:
+                raise SystemExit(f"[LOCAL] Missing required field 'name' in {p}")
 
-        # Optional: enforce DAC prefix and marker
-        if not name.startswith(DAC_PREFIX):
-            obj["name"] = f"{DAC_PREFIX}{name}"
-            name = obj["name"]
+            # Optional enforcement (OFF by default for known-good rules)
+            if ENFORCE_PREFIX and not name.startswith(DAC_PREFIX):
+                obj["name"] = f"{DAC_PREFIX}{name}"
+                name = obj["name"]
 
-        desc = (obj.get("description") or "").strip()
-        if DAC_MARKER not in desc:
-            obj["description"] = (desc + "\n\n" + DAC_MARKER).strip()
+            if ENFORCE_MARKER:
+                desc = obj.get("description")
+                if desc is None:
+                    desc = ""
+                desc = str(desc).strip()
+                if DAC_MARKER not in desc:
+                    obj["description"] = (desc + "\n\n" + DAC_MARKER).strip()
 
-        if name in seen_names:
-            raise SystemExit(
-                f"[LOCAL] Duplicate correlation name detected:\n"
-                f"  name: {name}\n"
-                f"  files: {seen_names[name]} and {p}"
-            )
-        seen_names[name] = p
-
-        correlations.append(obj)
+            if name in seen_names:
+                raise SystemExit(
+                    f"[LOCAL] Duplicate correlation name detected:\n"
+                    f"  name: {name}\n"
+                    f"  files: {seen_names[name]} and {p}"
+                )
+            seen_names[name] = p
+            correlations.append(obj)
 
     return correlations
 
@@ -257,10 +285,16 @@ def update_rule(session: requests.Session, base_url: str, obj: dict, rule_id: An
         raise SystemExit(f"Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
 
 
+def extract_rule_id(existing: dict) -> Any:
+    return existing.get("id") or existing.get("rule_id") or existing.get("ruleId")
+
+
 def main() -> None:
     print("=== RECONCILE_XSIAM.PY START (correlations only) ===")
     print(f"[RECON] cwd={Path.cwd()}")
     print(f"[RECON] DRY_RUN={DRY_RUN}")
+    print(f"[RECON] corr_dir={CORR_DIR.resolve()}")
+    print(f"[RECON] enforce_prefix={ENFORCE_PREFIX} enforce_marker={ENFORCE_MARKER}")
 
     base_url = normalize_base_url(must_env("XSIAM_FQDN"))
     api_key = must_env("XSIAM_API_KEY")
@@ -290,18 +324,20 @@ def main() -> None:
     created = updated = unchanged = 0
 
     for obj in local:
-        name = obj["name"].strip()
+        name = (obj.get("name") or "").strip()
+        if not name:
+            raise SystemExit("[RECON] Encountered correlation without a name after loading. This should not happen.")
+
         print(f"[correlation] upsert by name: {name}")
 
         existing = remote_by_name.get(name)
 
         if existing:
-            rid = existing.get("id") or existing.get("rule_id") or existing.get("ruleId")
+            rid = extract_rule_id(existing)
             if not rid:
-                # fallback: attempt name query to grab ID
                 by_name = get_correlation_by_name(s, base_url, name)
                 if by_name:
-                    rid = by_name[0].get("id") or by_name[0].get("rule_id") or by_name[0].get("ruleId")
+                    rid = extract_rule_id(by_name[0])
             if not rid:
                 raise SystemExit(f"[correlation] Could not determine rule_id for existing correlation: {name}")
 
@@ -323,7 +359,6 @@ def main() -> None:
             else:
                 raise SystemExit(f"[correlation] Create returned no added_objects. Full response: {resp}")
 
-        # Verify it exists by name
         verify = get_correlation_by_name(s, base_url, name)
         ids = [v.get("id") for v in verify]
         print(f"[correlation] verify: count={len(verify)} ids={ids}")
