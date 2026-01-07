@@ -255,8 +255,6 @@ def _try_insert_with_shapes(
             obj.pop("rule_id", None)
         elif shape == "rule_id_null":
             obj["rule_id"] = None
-        elif shape == "rule_id_zero":
-            obj["rule_id"] = 0
         else:
             raise ValueError(f"Unknown shape: {shape}")
 
@@ -348,7 +346,7 @@ def main() -> None:
                 s,
                 base_url,
                 d,
-                shapes=["omit_rule_id", "rule_id_null", "rule_id_zero"],
+                shapes=["omit_rule_id", "rule_id_null"],
             )
             add_n = len(resp.get("added_objects") or [])
             upd_n = len(resp.get("updated_objects") or [])
