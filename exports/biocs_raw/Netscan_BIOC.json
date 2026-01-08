@@ -1,0 +1,102 @@
+{
+  "rule_id": 370,
+  "name": "Netscan BIOC",
+  "severity": "SEV_030_MEDIUM",
+  "type": "DISCOVERY",
+  "is_xql": false,
+  "comment": "Detection for Netscan.exe",
+  "status": "ENABLED",
+  "mitre_technique_id_and_name": [
+    "T1595 - Active Scanning",
+    "T1595.001 - Active Scanning: Scanning IP Blocks"
+  ],
+  "mitre_tactic_id_and_name": [
+    "TA0007 - Discovery"
+  ],
+  "indicator": {
+    "runOnCGO": true,
+    "investigationType": "FILE_EVENT",
+    "investigation": {
+      "FILE_EVENT": {
+        "filter": {
+          "AND": [
+            {
+              "OR": [
+                {
+                  "SEARCH_FIELD": "event_sub_type",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "1",
+                  "isExtended": false
+                },
+                {
+                  "SEARCH_FIELD": "event_sub_type",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "2",
+                  "isExtended": false
+                },
+                {
+                  "SEARCH_FIELD": "event_sub_type",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "3",
+                  "isExtended": false
+                },
+                {
+                  "SEARCH_FIELD": "event_sub_type",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "5",
+                  "isExtended": false
+                },
+                {
+                  "SEARCH_FIELD": "event_sub_type",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "6",
+                  "isExtended": false
+                }
+              ]
+            },
+            {
+              "SEARCH_FIELD": "action_file_name",
+              "SEARCH_TYPE": "EQ",
+              "SEARCH_VALUE": "netscan.exe",
+              "EXTRA_FIELDS": [],
+              "isExtended": false
+            },
+            {
+              "OR": [
+                {
+                  "SEARCH_FIELD": "actor_process_image_name",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "netscan.exe",
+                  "EXTRA_FIELDS": [
+                    "causality_actor_process_image_name",
+                    "os_actor_process_image_name"
+                  ],
+                  "isExtended": false,
+                  "node": "xdr_actor"
+                },
+                {
+                  "SEARCH_FIELD": "causality_actor_process_image_name",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "netscan.exe",
+                  "isExtended": true,
+                  "node": "xdr_actor"
+                },
+                {
+                  "SEARCH_FIELD": "os_actor_process_image_name",
+                  "SEARCH_TYPE": "EQ",
+                  "SEARCH_VALUE": "netscan.exe",
+                  "isExtended": true,
+                  "node": "xdr_actor"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "creation_time": 1767880306230,
+  "modification_time": 1767880348692,
+  "source": "balmond@presidio.com",
+  "number_of_issues": 0
+}

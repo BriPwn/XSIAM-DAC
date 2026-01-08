@@ -1,0 +1,16 @@
+{
+  "rule_id": 1,
+  "indicator": "3073af95dfc18361caebccd69d0021a2",
+  "type": "HASH",
+  "severity": "SEV_040_HIGH",
+  "expiration_date": -1,
+  "default_expiration_enabled": true,
+  "comment": "netscan.exe known scanning tool",
+  "reputation": "SUSPICIOUS",
+  "reliability": "B",
+  "creation_time": 1767879920080,
+  "modification_time": 1767879920080,
+  "status": "ENABLED",
+  "source": "balmond@presidio.com",
+  "number_of_issues": 0
+}

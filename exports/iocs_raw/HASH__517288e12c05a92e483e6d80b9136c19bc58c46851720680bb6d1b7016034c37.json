@@ -1,0 +1,16 @@
+{
+  "rule_id": 3,
+  "indicator": "517288e12c05a92e483e6d80b9136c19bc58c46851720680bb6d1b7016034c37",
+  "type": "HASH",
+  "severity": "SEV_040_HIGH",
+  "expiration_date": -1,
+  "default_expiration_enabled": true,
+  "comment": "Managed by detections-as-code",
+  "reputation": "BAD",
+  "reliability": "A",
+  "creation_time": 1767886234466,
+  "modification_time": 1767886234466,
+  "status": "ENABLED",
+  "source": "Public API user (key #7)",
+  "number_of_issues": 0
+}
