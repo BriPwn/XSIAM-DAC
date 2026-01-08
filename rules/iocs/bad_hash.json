@@ -1,0 +1,9 @@
+{
+  "indicator": "0123456789abcdef0123456789abcdef",
+  "type": "HASH",
+  "severity": "SEV_040_HIGH",
+  "reputation": "BAD",
+  "reliability": "A",
+  "default_expiration_enabled": true,
+  "comment": "Managed by detections-as-code"
+}

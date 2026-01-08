@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-Correlation-only reconciliation for Cortex XSIAM.
+Reconcile Cortex XSIAM objects from repo (correlations + BIOCs + IOCs).
 
-Source of truth: rules/correlations/*.json
-Upsert key: correlation "name"
+Folders (defaults):
+- rules/correlations/*.json
+- rules/biocs/*.json
+- rules/iocs/*.json
 
-Behavior:
-- CREATE: POST /public_api/v1/correlations/insert with rule_id omitted (fallback rule_id=null)
-- UPDATE: POST /public_api/v1/correlations/insert with rule_id set to existing id
-- VERIFY: GET by name after upsert
+Upsert keys:
+- Correlations: name
+- BIOCs: name
+- IOCs: (type, indicator)
+
+Create/update endpoints:
+- correlations: /public_api/v1/correlations/get, /public_api/v1/correlations/insert
+- biocs:        /public_api/v1/bioc/get,        /public_api/v1/bioc/insert
+- iocs:         /public_api/v1/indicators/get,  /public_api/v1/indicators/insert
 
 Notes:
-- Does NOT mutate rule payloads by default (important for "known-good" rules).
-- If you want enforced naming/marking, enable:
-    ENFORCE_PREFIX=true and/or ENFORCE_MARKER=true
+- Does NOT mutate payloads by default (best for "known-good" rules).
+- Update path uses rule_id/id from GET results.
+- Create path omits rule_id (fallback rule_id=null) to avoid "0 means update" behavior.
 """
 
 from __future__ import annotations
@@ -24,24 +31,31 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 
-# -------- Config (env) --------
+# ------------------ Config (env) ------------------
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
 
-CORR_DIR = Path(os.getenv("CORRELATIONS_DIR", "rules/correlations"))
+ENABLE_CORRELATIONS = os.getenv("ENABLE_CORRELATIONS", "true").lower() in ("1", "true", "yes")
+ENABLE_BIOCS = os.getenv("ENABLE_BIOCS", "true").lower() in ("1", "true", "yes")
+ENABLE_IOCS = os.getenv("ENABLE_IOCS", "true").lower() in ("1", "true", "yes")
 
+CORR_DIR = Path(os.getenv("CORRELATIONS_DIR", "rules/correlations"))
+BIOC_DIR = Path(os.getenv("BIOCS_DIR", "rules/biocs"))
+IOC_DIR = Path(os.getenv("IOCS_DIR", "rules/iocs"))
+
+# Optional enforcement toggles (OFF by default)
 ENFORCE_PREFIX = os.getenv("ENFORCE_PREFIX", "false").lower() in ("1", "true", "yes")
 ENFORCE_MARKER = os.getenv("ENFORCE_MARKER", "false").lower() in ("1", "true", "yes")
 DAC_PREFIX = os.getenv("DAC_PREFIX", "DAC: ").strip() or "DAC: "
 DAC_MARKER = os.getenv("DAC_MARKER", "Managed by detections-as-code")
 
 
-# -------- Errors --------
+# ------------------ Errors ------------------
 @dataclass
 class NonRetryableHTTP(Exception):
     status_code: int
@@ -49,7 +63,7 @@ class NonRetryableHTTP(Exception):
     body: str
 
 
-# -------- Helpers --------
+# ------------------ Helpers ------------------
 def must_env(name: str) -> str:
     v = (os.environ.get(name) or "").strip()
     if not v:
@@ -71,7 +85,7 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
     """
     url = f"{base_url}{path}"
 
-    if DRY_RUN and path.endswith("/insert"):
+    if DRY_RUN and (path.endswith("/insert") or path.endswith("/insert_jsons") or path.endswith("/insert_csv")):
         print(f"[HTTP] DRY_RUN skip POST {url}")
         return {"dry_run": True, "path": path, "payload": payload, "errors": []}
 
@@ -80,12 +94,10 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
         try:
             r = session.post(url, json=payload, timeout=(10, 180))
 
-            # Non-retryable 4xx (except 429)
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 body = (r.text or "")[:4000]
                 raise NonRetryableHTTP(r.status_code, url, body)
 
-            # Retry-worthy
             if r.status_code in (429, 500, 502, 503, 504, 599):
                 body = (r.text or "")[:1200]
                 raise HTTPError(f"HTTP {r.status_code} from {url}. Body: {body}", response=r)
@@ -131,39 +143,58 @@ def parse_objects(resp: dict) -> List[dict]:
     return []
 
 
-def parse_objects_count(resp: dict) -> Optional[int]:
-    if isinstance(resp.get("objects_count"), int):
-        return resp["objects_count"]
-    rep = resp.get("reply")
-    if isinstance(rep, dict) and isinstance(rep.get("objects_count"), int):
-        return rep.get("objects_count")
-    return None
+def _ensure_list_of_objects(parsed: Any, path: Path) -> List[dict]:
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list) and all(isinstance(x, dict) for x in parsed):
+        return parsed
+    raise SystemExit(f"[LOCAL] {path} must be a JSON object or list of objects.")
 
 
-def paged_get_all_correlations(session: requests.Session, base_url: str, page_size: int = 100) -> List[dict]:
-    # still useful for export, but NOT used for reconcile decisions
-    if page_size <= 0 or page_size > 100:
-        raise ValueError("page_size must be 1..100")
+def _load_json_dir(dir_path: Path, label: str) -> List[dict]:
+    if not dir_path.exists():
+        print(f"[LOCAL] {label}_dir missing, skipping: {dir_path.resolve()}")
+        return []
+
+    files = sorted([p for p in dir_path.glob("*.json") if p.name != ".gitkeep"])
+    print(f"[LOCAL] {label}_dir={dir_path.resolve()} files={len(files)}")
+    if not files:
+        return []
 
     out: List[dict] = []
-    start = 0
-    while True:
-        payload = {"request_data": {"extended_view": True, "search_from": start, "search_to": start + page_size}}
-        resp = http_post(session, base_url, "/public_api/v1/correlations/get", payload)
-        objs = parse_objects(resp)
-        out.extend(objs)
-
-        count = parse_objects_count(resp)
-        if count is not None and len(out) >= count:
-            break
-        if not objs:
-            break
-        start += page_size
-
+    for p in files:
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+        out.extend(_ensure_list_of_objects(parsed, p))
     return out
 
 
-def get_correlation_by_name(session: requests.Session, base_url: str, name: str) -> List[dict]:
+def _maybe_enforce_name_and_marker(obj: dict) -> None:
+    """
+    Optional enforcement for correlations/BIOCs that have a 'name' field.
+    OFF by default.
+    """
+    name = (obj.get("name") or "").strip()
+    if not name:
+        return
+
+    if ENFORCE_PREFIX and not name.startswith(DAC_PREFIX):
+        obj["name"] = f"{DAC_PREFIX}{name}"
+
+    if ENFORCE_MARKER:
+        desc = obj.get("description")
+        if desc is None:
+            desc = ""
+        desc = str(desc).strip()
+        if DAC_MARKER not in desc:
+            obj["description"] = (desc + "\n\n" + DAC_MARKER).strip()
+
+
+def _extract_rule_id(existing: dict) -> Any:
+    return existing.get("id") or existing.get("rule_id") or existing.get("ruleId")
+
+
+# ------------------ Correlations ------------------
+def correlation_get_by_name(session: requests.Session, base_url: str, name: str) -> List[dict]:
     payload = {
         "request_data": {
             "extended_view": True,
@@ -172,76 +203,10 @@ def get_correlation_by_name(session: requests.Session, base_url: str, name: str)
             "search_to": 1,
         }
     }
-    resp = http_post(session, base_url, "/public_api/v1/correlations/get", payload)
-    return parse_objects(resp)
+    return parse_objects(http_post(session, base_url, "/public_api/v1/correlations/get", payload))
 
 
-def _ensure_list_of_objects(parsed: Any, path: Path) -> List[dict]:
-    """
-    Accept either:
-      - single JSON object (dict)
-      - list of JSON objects (list[dict])
-    """
-    if isinstance(parsed, dict):
-        return [parsed]
-    if isinstance(parsed, list) and all(isinstance(x, dict) for x in parsed):
-        return parsed
-    raise SystemExit(f"[LOCAL] {path} must be a JSON object or list of objects.")
-
-
-def load_local_correlations() -> List[dict]:
-    if not CORR_DIR.exists():
-        raise SystemExit(f"Correlation directory not found: {CORR_DIR.resolve()}")
-
-    files = sorted([p for p in CORR_DIR.glob("*.json") if p.name != ".gitkeep"])
-    print(f"[LOCAL] correlations_dir={CORR_DIR.resolve()} files={len(files)}")
-    if not files:
-        raise SystemExit(f"[LOCAL] No correlation JSON files found in {CORR_DIR.resolve()}")
-
-    correlations: List[dict] = []
-    seen_names: Dict[str, Path] = {}
-
-    for p in files:
-        parsed = json.loads(p.read_text(encoding="utf-8"))
-        objs = _ensure_list_of_objects(parsed, p)
-
-        for obj in objs:
-            name = (obj.get("name") or "").strip()
-            if not name:
-                raise SystemExit(f"[LOCAL] Missing required field 'name' in {p}")
-
-            # Optional enforcement (OFF by default for known-good rules)
-            if ENFORCE_PREFIX and not name.startswith(DAC_PREFIX):
-                obj["name"] = f"{DAC_PREFIX}{name}"
-                name = obj["name"]
-
-            if ENFORCE_MARKER:
-                desc = obj.get("description")
-                if desc is None:
-                    desc = ""
-                desc = str(desc).strip()
-                if DAC_MARKER not in desc:
-                    obj["description"] = (desc + "\n\n" + DAC_MARKER).strip()
-
-            if name in seen_names:
-                raise SystemExit(
-                    f"[LOCAL] Duplicate correlation name detected:\n"
-                    f"  name: {name}\n"
-                    f"  files: {seen_names[name]} and {p}"
-                )
-            seen_names[name] = p
-            correlations.append(obj)
-
-    return correlations
-
-
-def create_with_shape_fallback(session: requests.Session, base_url: str, obj: dict) -> dict:
-    """
-    Some tenants interpret rule_id=0 as update. We never use 0.
-    We try:
-      1) omit rule_id
-      2) rule_id = null
-    """
+def correlation_create_with_shape_fallback(session: requests.Session, base_url: str, obj: dict) -> dict:
     shapes = ["omit_rule_id", "rule_id_null"]
     last_400: Optional[str] = None
 
@@ -249,54 +214,131 @@ def create_with_shape_fallback(session: requests.Session, base_url: str, obj: di
         payload_obj = dict(obj)
         if shape == "omit_rule_id":
             payload_obj.pop("rule_id", None)
-        elif shape == "rule_id_null":
+        else:
             payload_obj["rule_id"] = None
 
-        print(f"[correlation] create insert attempt shape={shape}")
+        print(f"[correlation] create attempt shape={shape}")
         try:
             return http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [payload_obj]})
         except NonRetryableHTTP as e:
             if e.status_code != 400:
-                raise SystemExit(f"Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+                raise SystemExit(f"[correlation] Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
             last_400 = e.body
             continue
 
-    raise SystemExit(
-        "[correlation] Create failed for all shapes.\n"
-        f"Last 400 body:\n{(last_400 or '')}"
-    )
+    raise SystemExit(f"[correlation] Create failed. Last 400 body:\n{last_400 or ''}")
 
 
-def update_rule(session: requests.Session, base_url: str, obj: dict, rule_id: Any) -> dict:
+def correlation_update(session: requests.Session, base_url: str, obj: dict, rule_id: Any) -> dict:
     payload_obj = dict(obj)
     payload_obj["rule_id"] = rule_id
-    print(f"[correlation] update insert rule_id={rule_id}")
-    try:
-        return http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [payload_obj]})
-    except NonRetryableHTTP as e:
-        raise SystemExit(f"Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+    print(f"[correlation] update rule_id={rule_id}")
+    return http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [payload_obj]})
 
 
-def extract_rule_id(existing: dict) -> Any:
-    # Most tenants return "id". Some may return rule_id/ruleId.
-    return existing.get("id") or existing.get("rule_id") or existing.get("ruleId")
+# ------------------ BIOCs ------------------
+def bioc_get_by_name(session: requests.Session, base_url: str, name: str) -> List[dict]:
+    payload = {
+        "request_data": {
+            "extended_view": True,
+            "filters": [{"field": "name", "operator": "EQ", "value": name}],
+            "search_from": 0,
+            "search_to": 1,
+        }
+    }
+    return parse_objects(http_post(session, base_url, "/public_api/v1/bioc/get", payload))
 
 
-def _resp_list(resp: dict, key: str) -> list:
-    # Some tenants may wrap under reply; keep robust.
-    if isinstance(resp.get(key), list):
-        return resp[key]
-    rep = resp.get("reply")
-    if isinstance(rep, dict) and isinstance(rep.get(key), list):
-        return rep[key]
-    return []
+def bioc_create_with_shape_fallback(session: requests.Session, base_url: str, obj: dict) -> dict:
+    shapes = ["omit_rule_id", "rule_id_null"]
+    last_400: Optional[str] = None
+
+    for shape in shapes:
+        payload_obj = dict(obj)
+        if shape == "omit_rule_id":
+            payload_obj.pop("rule_id", None)
+        else:
+            payload_obj["rule_id"] = None
+
+        print(f"[bioc] create attempt shape={shape}")
+        try:
+            return http_post(session, base_url, "/public_api/v1/bioc/insert", {"request_data": [payload_obj]})
+        except NonRetryableHTTP as e:
+            if e.status_code != 400:
+                raise SystemExit(f"[bioc] Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+            last_400 = e.body
+            continue
+
+    raise SystemExit(f"[bioc] Create failed. Last 400 body:\n{last_400 or ''}")
 
 
+def bioc_update(session: requests.Session, base_url: str, obj: dict, rule_id: Any) -> dict:
+    payload_obj = dict(obj)
+    payload_obj["rule_id"] = rule_id
+    print(f"[bioc] update rule_id={rule_id}")
+    return http_post(session, base_url, "/public_api/v1/bioc/insert", {"request_data": [payload_obj]})
+
+
+# ------------------ IOCs ------------------
+def ioc_key(obj: dict) -> Tuple[str, str]:
+    t = (obj.get("type") or "").strip()
+    ind = (obj.get("indicator") or "").strip()
+    if not t or not ind:
+        raise SystemExit(f"[IOC] IOC missing required fields: type={t!r} indicator={ind!r}")
+    return (t, ind)
+
+
+def ioc_get_by_key(session: requests.Session, base_url: str, t: str, indicator: str) -> List[dict]:
+    payload = {
+        "request_data": {
+            "extended_view": True,
+            "filters": [
+                {"field": "type", "operator": "EQ", "value": [t]},
+                {"field": "indicator", "operator": "EQ", "value": [indicator]},
+            ],
+            "search_from": 0,
+            "search_to": 1,
+        }
+    }
+    return parse_objects(http_post(session, base_url, "/public_api/v1/indicators/get", payload))
+
+
+def ioc_create_with_shape_fallback(session: requests.Session, base_url: str, obj: dict) -> dict:
+    shapes = ["omit_rule_id", "rule_id_null"]
+    last_400: Optional[str] = None
+
+    for shape in shapes:
+        payload_obj = dict(obj)
+        if shape == "omit_rule_id":
+            payload_obj.pop("rule_id", None)
+        else:
+            payload_obj["rule_id"] = None
+
+        print(f"[ioc] create attempt shape={shape}")
+        try:
+            return http_post(session, base_url, "/public_api/v1/indicators/insert", {"request_data": [payload_obj]})
+        except NonRetryableHTTP as e:
+            if e.status_code != 400:
+                raise SystemExit(f"[ioc] Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+            last_400 = e.body
+            continue
+
+    raise SystemExit(f"[ioc] Create failed. Last 400 body:\n{last_400 or ''}")
+
+
+def ioc_update(session: requests.Session, base_url: str, obj: dict, rule_id: Any) -> dict:
+    payload_obj = dict(obj)
+    payload_obj["rule_id"] = rule_id
+    print(f"[ioc] update rule_id={rule_id}")
+    return http_post(session, base_url, "/public_api/v1/indicators/insert", {"request_data": [payload_obj]})
+
+
+# ------------------ Main ------------------
 def main() -> None:
-    print("=== RECONCILE_XSIAM.PY START (correlations only) ===")
+    print("=== RECONCILE_XSIAM.PY START ===")
     print(f"[RECON] cwd={Path.cwd()}")
     print(f"[RECON] DRY_RUN={DRY_RUN}")
-    print(f"[RECON] corr_dir={CORR_DIR.resolve()}")
+    print(f"[RECON] enable: correlations={ENABLE_CORRELATIONS} biocs={ENABLE_BIOCS} iocs={ENABLE_IOCS}")
     print(f"[RECON] enforce_prefix={ENFORCE_PREFIX} enforce_marker={ENFORCE_MARKER}")
 
     base_url = normalize_base_url(must_env("XSIAM_FQDN"))
@@ -317,49 +359,125 @@ def main() -> None:
         }
     )
 
-    local = load_local_correlations()
-    print(f"[RECON] desired correlations={len(local)}")
+    created = updated = 0
 
-    created = updated = unchanged = 0
+    # -------- Correlations --------
+    if ENABLE_CORRELATIONS:
+        corrs = _load_json_dir(CORR_DIR, "correlations")
+        # enforce uniqueness by name
+        seen: Dict[str, Path] = {}
+        names: set[str] = set()
 
-    for obj in local:
-        name = (obj.get("name") or "").strip()
-        if not name:
-            raise SystemExit("[RECON] Encountered correlation without a name after loading. This should not happen.")
+        for obj in corrs:
+            if "name" not in obj:
+                raise SystemExit("[correlation] Missing 'name' in a correlation object.")
+            _maybe_enforce_name_and_marker(obj)
+            n = (obj.get("name") or "").strip()
+            if not n:
+                raise SystemExit("[correlation] Empty 'name' after processing.")
+            if n in names:
+                raise SystemExit(f"[correlation] Duplicate name in local repo: {n}")
+            names.add(n)
 
-        print(f"[correlation] upsert by name: {name}")
+        print(f"[RECON] correlations desired={len(corrs)}")
+        for obj in corrs:
+            name = obj["name"].strip()
+            print(f"[correlation] upsert by name: {name}")
 
-        # Critical change: always resolve existence by name (no full export dependency)
-        existing_list = get_correlation_by_name(s, base_url, name)
-        existing = existing_list[0] if existing_list else None
+            existing_list = correlation_get_by_name(s, base_url, name)
+            existing = existing_list[0] if existing_list else None
 
-        if existing:
-            rid = extract_rule_id(existing)
-            if not rid:
-                raise SystemExit(f"[correlation] Could not determine id for existing rule: {name}")
+            if existing:
+                rid = _extract_rule_id(existing)
+                if not rid:
+                    raise SystemExit(f"[correlation] Could not determine id for existing rule: {name}")
+                correlation_update(s, base_url, obj, rid)
+                updated += 1
+            else:
+                correlation_create_with_shape_fallback(s, base_url, obj)
+                created += 1
 
-            resp = update_rule(s, base_url, obj, rid)
-            add_n = len(_resp_list(resp, "added_objects"))
-            upd_n = len(_resp_list(resp, "updated_objects"))
-            print(f"[correlation] update response: added={add_n} updated={upd_n}")
+            verify = correlation_get_by_name(s, base_url, name)
+            if not verify:
+                raise SystemExit(f"[correlation] Verify failed: not found after upsert: {name}")
+            print(f"[correlation] verify ok: id={_extract_rule_id(verify[0])}")
 
-            # Some tenants don't populate updated_objects reliably; treat as updated if we took update path
-            updated += 1
-        else:
-            resp = create_with_shape_fallback(s, base_url, obj)
-            add_n = len(_resp_list(resp, "added_objects"))
-            upd_n = len(_resp_list(resp, "updated_objects"))
-            print(f"[correlation] create response: added={add_n} updated={upd_n}")
-            created += 1
+    # -------- BIOCs --------
+    if ENABLE_BIOCS:
+        biocs = _load_json_dir(BIOC_DIR, "biocs")
 
-        # Verify
-        verify = get_correlation_by_name(s, base_url, name)
-        if not verify:
-            raise SystemExit(f"[correlation] Verify failed: correlation not found after upsert: {name}")
-        vid = extract_rule_id(verify[0])
-        print(f"[correlation] verify ok: id={vid}")
+        # dedupe by name
+        seen_names: set[str] = set()
+        for obj in biocs:
+            if "name" not in obj:
+                raise SystemExit("[bioc] Missing 'name' in a BIOC object.")
+            _maybe_enforce_name_and_marker(obj)
+            n = (obj.get("name") or "").strip()
+            if not n:
+                raise SystemExit("[bioc] Empty 'name' after processing.")
+            if n in seen_names:
+                raise SystemExit(f"[bioc] Duplicate name in local repo: {n}")
+            seen_names.add(n)
 
-    print(f"[RECON] Summary: created={created} updated={updated} unchanged={unchanged}")
+        print(f"[RECON] biocs desired={len(biocs)}")
+        for obj in biocs:
+            name = obj["name"].strip()
+            print(f"[bioc] upsert by name: {name}")
+
+            existing_list = bioc_get_by_name(s, base_url, name)
+            existing = existing_list[0] if existing_list else None
+
+            if existing:
+                rid = _extract_rule_id(existing)
+                if not rid:
+                    raise SystemExit(f"[bioc] Could not determine rule_id for existing BIOC: {name}")
+                bioc_update(s, base_url, obj, rid)
+                updated += 1
+            else:
+                bioc_create_with_shape_fallback(s, base_url, obj)
+                created += 1
+
+            verify = bioc_get_by_name(s, base_url, name)
+            if not verify:
+                raise SystemExit(f"[bioc] Verify failed: not found after upsert: {name}")
+            print(f"[bioc] verify ok: id={_extract_rule_id(verify[0])}")
+
+    # -------- IOCs --------
+    if ENABLE_IOCS:
+        iocs = _load_json_dir(IOC_DIR, "iocs")
+
+        # dedupe by (type, indicator)
+        seen_keys: set[Tuple[str, str]] = set()
+        for obj in iocs:
+            k = ioc_key(obj)
+            if k in seen_keys:
+                raise SystemExit(f"[ioc] Duplicate IOC in local repo: type={k[0]} indicator={k[1]}")
+            seen_keys.add(k)
+
+        print(f"[RECON] iocs desired={len(iocs)}")
+        for obj in iocs:
+            t, ind = ioc_key(obj)
+            print(f"[ioc] upsert by key: type={t} indicator={ind}")
+
+            existing_list = ioc_get_by_key(s, base_url, t, ind)
+            existing = existing_list[0] if existing_list else None
+
+            if existing:
+                rid = _extract_rule_id(existing)
+                if not rid:
+                    raise SystemExit(f"[ioc] Could not determine rule_id for existing IOC: type={t} indicator={ind}")
+                ioc_update(s, base_url, obj, rid)
+                updated += 1
+            else:
+                ioc_create_with_shape_fallback(s, base_url, obj)
+                created += 1
+
+            verify = ioc_get_by_key(s, base_url, t, ind)
+            if not verify:
+                raise SystemExit(f"[ioc] Verify failed: not found after upsert: type={t} indicator={ind}")
+            print(f"[ioc] verify ok: id={_extract_rule_id(verify[0])}")
+
+    print(f"[RECON] Summary: created={created} updated={updated}")
 
 
 if __name__ == "__main__":

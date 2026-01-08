@@ -30,13 +30,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Reconcile correlations into XSIAM
+      - name: Reconcile into XSIAM
         env:
           XSIAM_FQDN: ${{ secrets.XSIAM_FQDN }}
           XSIAM_API_KEY: ${{ secrets.XSIAM_API_KEY }}
           XSIAM_API_KEY_ID: ${{ secrets.XSIAM_API_KEY_ID }}
           DRY_RUN: "false"
-          DAC_PREFIX: "DAC: "
-          DAC_MARKER: "Managed by detections-as-code"
+          ENABLE_CORRELATIONS: "true"
+          ENABLE_BIOCS: "true"
+          ENABLE_IOCS: "true"
         run: |
           python -u scripts/reconcile_xsiam.py
