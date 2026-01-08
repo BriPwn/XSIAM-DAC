@@ -4,7 +4,7 @@
   "severity": "SEV_030_MEDIUM",
   "type": "DISCOVERY",
   "is_xql": false,
-  "comment": "Detection for Netscan.exe",
+  "comment": "Detection for Netscan.exe Updated",
   "status": "ENABLED",
   "mitre_technique_id_and_name": [
     "T1595 - Active Scanning",
