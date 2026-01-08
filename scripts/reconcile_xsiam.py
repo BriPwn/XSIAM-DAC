@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-Reconcile Cortex XSIAM objects from repo (correlations + BIOCs + IOCs).
+Reconcile Cortex XSIAM objects from repo:
+- Correlations (supported)
+- IOCs (supported)
+- BIOCs (optional; some tenants return "BIOC not supported")
 
 Folders (defaults):
 - rules/correlations/*.json
-- rules/biocs/*.json
 - rules/iocs/*.json
+- rules/biocs/*.json   (optional)
 
 Upsert keys:
 - Correlations: name
-- BIOCs: name
 - IOCs: (type, indicator)
+- BIOCs: name
 
-Create/update endpoints:
+Endpoints:
 - correlations: /public_api/v1/correlations/get, /public_api/v1/correlations/insert
-- biocs:        /public_api/v1/bioc/get,        /public_api/v1/bioc/insert
 - iocs:         /public_api/v1/indicators/get,  /public_api/v1/indicators/insert
+- biocs:        /public_api/v1/bioc/get,        /public_api/v1/bioc/insert
 
-Notes:
-- Does NOT mutate payloads by default (best for "known-good" rules).
-- Update path uses rule_id/id from GET results.
-- Create path omits rule_id (fallback rule_id=null) to avoid "0 means update" behavior.
+Behavior:
+- CREATE: insert with rule_id omitted (fallback rule_id=null)
+- UPDATE: insert with rule_id populated from GET results
+- VERIFY after each upsert
+
+Resilience:
+- If BIOC endpoints return "BIOC not supported", BIOCs are skipped for the run (unless STRICT_BIOC=true).
 """
 
 from __future__ import annotations
@@ -41,12 +47,15 @@ from requests.exceptions import ConnectionError, HTTPError, Timeout
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
 
 ENABLE_CORRELATIONS = os.getenv("ENABLE_CORRELATIONS", "true").lower() in ("1", "true", "yes")
-ENABLE_BIOCS = os.getenv("ENABLE_BIOCS", "true").lower() in ("1", "true", "yes")
 ENABLE_IOCS = os.getenv("ENABLE_IOCS", "true").lower() in ("1", "true", "yes")
+ENABLE_BIOCS = os.getenv("ENABLE_BIOCS", "true").lower() in ("1", "true", "yes")
+
+# If BIOC is unsupported and STRICT_BIOC=false, we skip BIOCs instead of failing the run.
+STRICT_BIOC = os.getenv("STRICT_BIOC", "false").lower() in ("1", "true", "yes")
 
 CORR_DIR = Path(os.getenv("CORRELATIONS_DIR", "rules/correlations"))
-BIOC_DIR = Path(os.getenv("BIOCS_DIR", "rules/biocs"))
 IOC_DIR = Path(os.getenv("IOCS_DIR", "rules/iocs"))
+BIOC_DIR = Path(os.getenv("BIOCS_DIR", "rules/biocs"))
 
 # Optional enforcement toggles (OFF by default)
 ENFORCE_PREFIX = os.getenv("ENFORCE_PREFIX", "false").lower() in ("1", "true", "yes")
@@ -94,10 +103,12 @@ def http_post(session: requests.Session, base_url: str, path: str, payload: dict
         try:
             r = session.post(url, json=payload, timeout=(10, 180))
 
+            # Non-retryable 4xx (except 429)
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 body = (r.text or "")[:4000]
                 raise NonRetryableHTTP(r.status_code, url, body)
 
+            # Retry-worthy
             if r.status_code in (429, 500, 502, 503, 504, 599):
                 body = (r.text or "")[:1200]
                 raise HTTPError(f"HTTP {r.status_code} from {url}. Body: {body}", response=r)
@@ -170,7 +181,7 @@ def _load_json_dir(dir_path: Path, label: str) -> List[dict]:
 
 def _maybe_enforce_name_and_marker(obj: dict) -> None:
     """
-    Optional enforcement for correlations/BIOCs that have a 'name' field.
+    Optional enforcement for objects that have a 'name' field.
     OFF by default.
     """
     name = (obj.get("name") or "").strip()
@@ -191,6 +202,20 @@ def _maybe_enforce_name_and_marker(obj: dict) -> None:
 
 def _extract_rule_id(existing: dict) -> Any:
     return existing.get("id") or existing.get("rule_id") or existing.get("ruleId")
+
+
+def _resp_list(resp: dict, key: str) -> list:
+    if isinstance(resp.get(key), list):
+        return resp[key]
+    rep = resp.get("reply")
+    if isinstance(rep, dict) and isinstance(rep.get(key), list):
+        return rep[key]
+    return []
+
+
+def _is_bioc_unsupported_error(body: str) -> bool:
+    b = (body or "").lower()
+    return "bioc not supported" in b
 
 
 # ------------------ Correlations ------------------
@@ -234,49 +259,6 @@ def correlation_update(session: requests.Session, base_url: str, obj: dict, rule
     payload_obj["rule_id"] = rule_id
     print(f"[correlation] update rule_id={rule_id}")
     return http_post(session, base_url, "/public_api/v1/correlations/insert", {"request_data": [payload_obj]})
-
-
-# ------------------ BIOCs ------------------
-def bioc_get_by_name(session: requests.Session, base_url: str, name: str) -> List[dict]:
-    payload = {
-        "request_data": {
-            "extended_view": True,
-            "filters": [{"field": "name", "operator": "EQ", "value": name}],
-            "search_from": 0,
-            "search_to": 1,
-        }
-    }
-    return parse_objects(http_post(session, base_url, "/public_api/v1/bioc/get", payload))
-
-
-def bioc_create_with_shape_fallback(session: requests.Session, base_url: str, obj: dict) -> dict:
-    shapes = ["omit_rule_id", "rule_id_null"]
-    last_400: Optional[str] = None
-
-    for shape in shapes:
-        payload_obj = dict(obj)
-        if shape == "omit_rule_id":
-            payload_obj.pop("rule_id", None)
-        else:
-            payload_obj["rule_id"] = None
-
-        print(f"[bioc] create attempt shape={shape}")
-        try:
-            return http_post(session, base_url, "/public_api/v1/bioc/insert", {"request_data": [payload_obj]})
-        except NonRetryableHTTP as e:
-            if e.status_code != 400:
-                raise SystemExit(f"[bioc] Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
-            last_400 = e.body
-            continue
-
-    raise SystemExit(f"[bioc] Create failed. Last 400 body:\n{last_400 or ''}")
-
-
-def bioc_update(session: requests.Session, base_url: str, obj: dict, rule_id: Any) -> dict:
-    payload_obj = dict(obj)
-    payload_obj["rule_id"] = rule_id
-    print(f"[bioc] update rule_id={rule_id}")
-    return http_post(session, base_url, "/public_api/v1/bioc/insert", {"request_data": [payload_obj]})
 
 
 # ------------------ IOCs ------------------
@@ -333,12 +315,63 @@ def ioc_update(session: requests.Session, base_url: str, obj: dict, rule_id: Any
     return http_post(session, base_url, "/public_api/v1/indicators/insert", {"request_data": [payload_obj]})
 
 
+# ------------------ BIOCs ------------------
+def bioc_get_by_name(session: requests.Session, base_url: str, name: str) -> List[dict]:
+    payload = {
+        "request_data": {
+            "extended_view": True,
+            "filters": [{"field": "name", "operator": "EQ", "value": name}],
+            "search_from": 0,
+            "search_to": 1,
+        }
+    }
+    return parse_objects(http_post(session, base_url, "/public_api/v1/bioc/get", payload))
+
+
+def bioc_create_with_shape_fallback(session: requests.Session, base_url: str, obj: dict) -> dict:
+    shapes = ["omit_rule_id", "rule_id_null"]
+    last_400: Optional[str] = None
+
+    for shape in shapes:
+        payload_obj = dict(obj)
+        if shape == "omit_rule_id":
+            payload_obj.pop("rule_id", None)
+        else:
+            payload_obj["rule_id"] = None
+
+        print(f"[bioc] create attempt shape={shape}")
+        try:
+            return http_post(session, base_url, "/public_api/v1/bioc/insert", {"request_data": [payload_obj]})
+        except NonRetryableHTTP as e:
+            # Graceful skip if unsupported
+            if e.status_code == 400 and _is_bioc_unsupported_error(e.body) and not STRICT_BIOC:
+                print("[bioc] BIOC not supported in this tenant/api-key. Skipping BIOCs for this run.")
+                return {"skipped": True, "reason": "BIOC not supported"}
+            raise SystemExit(f"[bioc] Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+
+    raise SystemExit(f"[bioc] Create failed. Last 400 body:\n{last_400 or ''}")
+
+
+def bioc_update(session: requests.Session, base_url: str, obj: dict, rule_id: Any) -> dict:
+    payload_obj = dict(obj)
+    payload_obj["rule_id"] = rule_id
+    print(f"[bioc] update rule_id={rule_id}")
+    try:
+        return http_post(session, base_url, "/public_api/v1/bioc/insert", {"request_data": [payload_obj]})
+    except NonRetryableHTTP as e:
+        if e.status_code == 400 and _is_bioc_unsupported_error(e.body) and not STRICT_BIOC:
+            print("[bioc] BIOC not supported in this tenant/api-key. Skipping BIOCs for this run.")
+            return {"skipped": True, "reason": "BIOC not supported"}
+        raise SystemExit(f"[bioc] Non-retryable HTTP {e.status_code} from {e.url}\nBody:\n{e.body}")
+
+
 # ------------------ Main ------------------
 def main() -> None:
     print("=== RECONCILE_XSIAM.PY START ===")
     print(f"[RECON] cwd={Path.cwd()}")
     print(f"[RECON] DRY_RUN={DRY_RUN}")
-    print(f"[RECON] enable: correlations={ENABLE_CORRELATIONS} biocs={ENABLE_BIOCS} iocs={ENABLE_IOCS}")
+    print(f"[RECON] enable: correlations={ENABLE_CORRELATIONS} iocs={ENABLE_IOCS} biocs={ENABLE_BIOCS}")
+    print(f"[RECON] strict_bioc={STRICT_BIOC}")
     print(f"[RECON] enforce_prefix={ENFORCE_PREFIX} enforce_marker={ENFORCE_MARKER}")
 
     base_url = normalize_base_url(must_env("XSIAM_FQDN"))
@@ -364,10 +397,7 @@ def main() -> None:
     # -------- Correlations --------
     if ENABLE_CORRELATIONS:
         corrs = _load_json_dir(CORR_DIR, "correlations")
-        # enforce uniqueness by name
-        seen: Dict[str, Path] = {}
-        names: set[str] = set()
-
+        seen_names: set[str] = set()
         for obj in corrs:
             if "name" not in obj:
                 raise SystemExit("[correlation] Missing 'name' in a correlation object.")
@@ -375,9 +405,9 @@ def main() -> None:
             n = (obj.get("name") or "").strip()
             if not n:
                 raise SystemExit("[correlation] Empty 'name' after processing.")
-            if n in names:
+            if n in seen_names:
                 raise SystemExit(f"[correlation] Duplicate name in local repo: {n}")
-            names.add(n)
+            seen_names.add(n)
 
         print(f"[RECON] correlations desired={len(corrs)}")
         for obj in corrs:
@@ -402,51 +432,9 @@ def main() -> None:
                 raise SystemExit(f"[correlation] Verify failed: not found after upsert: {name}")
             print(f"[correlation] verify ok: id={_extract_rule_id(verify[0])}")
 
-    # -------- BIOCs --------
-    if ENABLE_BIOCS:
-        biocs = _load_json_dir(BIOC_DIR, "biocs")
-
-        # dedupe by name
-        seen_names: set[str] = set()
-        for obj in biocs:
-            if "name" not in obj:
-                raise SystemExit("[bioc] Missing 'name' in a BIOC object.")
-            _maybe_enforce_name_and_marker(obj)
-            n = (obj.get("name") or "").strip()
-            if not n:
-                raise SystemExit("[bioc] Empty 'name' after processing.")
-            if n in seen_names:
-                raise SystemExit(f"[bioc] Duplicate name in local repo: {n}")
-            seen_names.add(n)
-
-        print(f"[RECON] biocs desired={len(biocs)}")
-        for obj in biocs:
-            name = obj["name"].strip()
-            print(f"[bioc] upsert by name: {name}")
-
-            existing_list = bioc_get_by_name(s, base_url, name)
-            existing = existing_list[0] if existing_list else None
-
-            if existing:
-                rid = _extract_rule_id(existing)
-                if not rid:
-                    raise SystemExit(f"[bioc] Could not determine rule_id for existing BIOC: {name}")
-                bioc_update(s, base_url, obj, rid)
-                updated += 1
-            else:
-                bioc_create_with_shape_fallback(s, base_url, obj)
-                created += 1
-
-            verify = bioc_get_by_name(s, base_url, name)
-            if not verify:
-                raise SystemExit(f"[bioc] Verify failed: not found after upsert: {name}")
-            print(f"[bioc] verify ok: id={_extract_rule_id(verify[0])}")
-
     # -------- IOCs --------
     if ENABLE_IOCS:
         iocs = _load_json_dir(IOC_DIR, "iocs")
-
-        # dedupe by (type, indicator)
         seen_keys: set[Tuple[str, str]] = set()
         for obj in iocs:
             k = ioc_key(obj)
@@ -465,7 +453,7 @@ def main() -> None:
             if existing:
                 rid = _extract_rule_id(existing)
                 if not rid:
-                    raise SystemExit(f"[ioc] Could not determine rule_id for existing IOC: type={t} indicator={ind}")
+                    raise SystemExit(f"[ioc] Could not determine id for existing IOC: type={t} indicator={ind}")
                 ioc_update(s, base_url, obj, rid)
                 updated += 1
             else:
@@ -476,6 +464,65 @@ def main() -> None:
             if not verify:
                 raise SystemExit(f"[ioc] Verify failed: not found after upsert: type={t} indicator={ind}")
             print(f"[ioc] verify ok: id={_extract_rule_id(verify[0])}")
+
+    # -------- BIOCs --------
+    if ENABLE_BIOCS:
+        biocs = _load_json_dir(BIOC_DIR, "biocs")
+        if biocs:
+            seen_names: set[str] = set()
+            for obj in biocs:
+                if "name" not in obj:
+                    raise SystemExit("[bioc] Missing 'name' in a BIOC object.")
+                _maybe_enforce_name_and_marker(obj)
+                n = (obj.get("name") or "").strip()
+                if not n:
+                    raise SystemExit("[bioc] Empty 'name' after processing.")
+                if n in seen_names:
+                    raise SystemExit(f"[bioc] Duplicate BIOC name in local repo: {n}")
+                seen_names.add(n)
+
+            print(f"[RECON] biocs desired={len(biocs)}")
+            bioc_supported = True
+
+            for obj in biocs:
+                if not bioc_supported:
+                    print("[bioc] Skipping remaining BIOCs (BIOC not supported).")
+                    break
+
+                name = obj["name"].strip()
+                print(f"[bioc] upsert by name: {name}")
+
+                try:
+                    existing_list = bioc_get_by_name(s, base_url, name)
+                except NonRetryableHTTP as e:
+                    if e.status_code == 400 and _is_bioc_unsupported_error(e.body) and not STRICT_BIOC:
+                        print("[bioc] BIOC not supported in this tenant/api-key. Skipping BIOCs for this run.")
+                        bioc_supported = False
+                        break
+                    raise
+
+                existing = existing_list[0] if existing_list else None
+
+                if existing:
+                    rid = _extract_rule_id(existing)
+                    if not rid:
+                        raise SystemExit(f"[bioc] Could not determine id for existing BIOC: {name}")
+                    resp = bioc_update(s, base_url, obj, rid)
+                    if resp.get("skipped"):
+                        bioc_supported = False
+                        break
+                    updated += 1
+                else:
+                    resp = bioc_create_with_shape_fallback(s, base_url, obj)
+                    if resp.get("skipped"):
+                        bioc_supported = False
+                        break
+                    created += 1
+
+                verify = bioc_get_by_name(s, base_url, name)
+                if not verify:
+                    raise SystemExit(f"[bioc] Verify failed: not found after upsert: {name}")
+                print(f"[bioc] verify ok: id={_extract_rule_id(verify[0])}")
 
     print(f"[RECON] Summary: created={created} updated={updated}")
 
