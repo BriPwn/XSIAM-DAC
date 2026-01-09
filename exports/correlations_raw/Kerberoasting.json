@@ -2,7 +2,7 @@
   "rule_id": 12,
   "name": "Kerberoasting",
   "severity": "SEV_040_HIGH",
-  "xql_query": "preset = xdr_event_log\n| alter TicketOptions = regextract(to_json_string(action_evtlog_data_fields)->TicketOptions{}, \"\\\"(.*)\\\"\")\n| alter TicketEncryptionType = regextract(to_json_string(action_evtlog_data_fields)->TicketEncryptionType{}, \"\\\"(.*)\\\"\")\n| alter ServiceName = regextract(to_json_string(action_evtlog_data_fields)->ServiceName{}, \"\\\"(.*)\\\"\")\n| filter (action_evtlog_event_id = 4769 and TicketOptions = \"0x40810000\" and TicketEncryptionType = \"0x17\") and  not (ServiceName = \"$*\")",
+  "xql_query": "preset = xdr_event_log\n| alter TicketOptions = regextract(to_json_string(action_evtlog_data_fields)->TicketOptions{}, \"\\\"(.*)\\\"\")\n| alter TicketEncryptionType = regextract(to_json_string(action_evtlog_data_fields)->TicketEncryptionType{}, \"\\\"(.*)\\\"\")\n| alter ServiceName = regextract(to_json_string(action_evtlog_data_fields)->ServiceName{}, \"\\\"(.*)\\\"\")\n| filter (action_evtlog_event_id = 4768 and TicketOptions = \"0x40810000\" and TicketEncryptionType = \"0x17\") and  not (ServiceName = \"$*\")",
   "is_enabled": true,
   "description": null,
   "alert_name": "Kerberoasting",
